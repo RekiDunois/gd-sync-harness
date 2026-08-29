@@ -15,30 +15,31 @@ var (
 
 // Profile is the canonical profile configuration record.
 type Profile struct {
-	ID                string   `json:"id"`
-	ProfileUUID       string   `json:"profile_uuid"`
-	Type              string   `json:"type"` // "obsidian" | "generic"
-	SourcePath        string   `json:"source_path"`
-	RemoteName        string   `json:"remote_name"`
-	RemoteFolderID    string   `json:"remote_folder_id"`
-	RemoteDisplayPath string   `json:"remote_display_path"`
-	Enabled           bool     `json:"enabled"`
-	MaxDelete         int      `json:"max_delete"`
-	MaxFileSize       int64    `json:"max_file_size"` // bytes; 0 = unlimited
-	DeletedAt         *string  `json:"deleted_at,omitempty"`
-	Tombstoned        bool     `json:"tombstoned"`
-	Excludes          []string `json:"excludes"`
+	ID                  string   `json:"id"`
+	ProfileUUID         string   `json:"profile_uuid"`
+	Type                string   `json:"type"` // "obsidian" | "generic"
+	SourcePath          string   `json:"source_path"`
+	RemoteName          string   `json:"remote_name"`
+	RemoteFolderID      string   `json:"remote_folder_id"`
+	RemoteDisplayPath   string   `json:"remote_display_path"`
+	Enabled             bool     `json:"enabled"`
+	MaxDelete           int      `json:"max_delete"`
+	MaxFileSize         int64    `json:"max_file_size"` // bytes; 0 = unlimited
+	DeletedAt           *string  `json:"deleted_at,omitempty"`
+	Tombstoned          bool     `json:"tombstoned"`
+	DeletionRequestedAt *string  `json:"deletion_requested_at,omitempty"`
+	Excludes            []string `json:"excludes"`
 }
 
 // scanProfile scans a full profile row (excludes loaded separately).
-func scanProfile(row *sql.Row) (*Profile, error) {
+func scanProfile(row interface{ Scan(...any) error }) (*Profile, error) {
 	var p Profile
 	var enabled, tomb int
-	var deleted sql.NullString
+	var deleted, delReq sql.NullString
 	if err := row.Scan(
 		&p.ID, &p.ProfileUUID, &p.Type, &p.SourcePath, &p.RemoteName,
 		&p.RemoteFolderID, &p.RemoteDisplayPath, &enabled, &p.MaxDelete,
-		&p.MaxFileSize, &deleted, &tomb,
+		&p.MaxFileSize, &deleted, &tomb, &delReq,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -50,12 +51,15 @@ func scanProfile(row *sql.Row) (*Profile, error) {
 	if deleted.Valid {
 		p.DeletedAt = &deleted.String
 	}
+	if delReq.Valid {
+		p.DeletionRequestedAt = &delReq.String
+	}
 	return &p, nil
 }
 
 const profileCols = `id, profile_uuid, type, source_path, remote_name,
 	remote_folder_id, remote_display_path, enabled, max_delete, max_file_size,
-	deleted_at, tombstoned`
+	deleted_at, tombstoned, deletion_requested_at`
 
 // GetProfile returns a profile by ID (tombstoned or not).
 func (d *DB) GetProfile(id string) (*Profile, error) {
@@ -87,11 +91,11 @@ func (d *DB) ListProfiles() ([]*Profile, error) {
 	for rows.Next() {
 		var p Profile
 		var enabled, tomb int
-		var deleted sql.NullString
+		var deleted, delReq sql.NullString
 		if err := rows.Scan(
 			&p.ID, &p.ProfileUUID, &p.Type, &p.SourcePath, &p.RemoteName,
 			&p.RemoteFolderID, &p.RemoteDisplayPath, &enabled, &p.MaxDelete,
-			&p.MaxFileSize, &deleted, &tomb,
+			&p.MaxFileSize, &deleted, &tomb, &delReq,
 		); err != nil {
 			return nil, err
 		}
@@ -99,6 +103,9 @@ func (d *DB) ListProfiles() ([]*Profile, error) {
 		p.Tombstoned = tomb == 1
 		if deleted.Valid {
 			p.DeletedAt = &deleted.String
+		}
+		if delReq.Valid {
+			p.DeletionRequestedAt = &delReq.String
 		}
 		out = append(out, &p)
 	}
@@ -164,6 +171,14 @@ func (d *DB) CreateProfile(p *Profile) error {
 	if _, err := tx.Exec(`INSERT INTO profile_runtime (profile_id) VALUES (?)`, p.ID); err != nil {
 		return err
 	}
+	// A new profile always records durable reconciliation intent: the initial
+	// full reconciliation is the only way to establish initialization evidence
+	// (§24.1). The worker claims this debt; no queued sync_run row is required.
+	if _, err := tx.Exec(`INSERT INTO profile_sync_state
+		(profile_id, desired_generation, state)
+		VALUES (?, 1, ?)`, p.ID, StateInitializing); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -209,6 +224,52 @@ func (d *DB) RestoreProfile(id string) error {
 	return err
 }
 
+// RequestProfileDeletion durably records deletion intent and disables the
+// profile. After this point no new reconciliation/retry claims may be created
+// for the profile (§19). Final row removal is deferred until no active run
+// remains.
+func (d *DB) RequestProfileDeletion(id string) error {
+	now := Now().Format(timeFmt)
+	res, err := d.Exec(`UPDATE profiles SET
+		enabled = 0,
+		deletion_requested_at = ?,
+		updated_at = ?
+		WHERE id = ?`, now, now, id)
+	if err != nil {
+		return err
+	}
+	return checkRows(res)
+}
+
+// CancelProfileDeletion clears a pending deletion request (used to make a
+// deletion request durable only, never by sync retry paths).
+func (d *DB) CancelProfileDeletion(id string) error {
+	_, err := d.Exec(`UPDATE profiles SET deletion_requested_at = NULL, updated_at = ? WHERE id = ?`,
+		Now().Format(timeFmt), id)
+	return err
+}
+
+// DeletingProfiles returns non-tombstoned profiles with a pending deletion
+// request, ordered by deletion_requested_at.
+func (d *DB) DeletingProfiles() ([]*Profile, error) {
+	rows, err := d.Query(`SELECT ` + profileCols + ` FROM profiles
+		WHERE tombstoned = 0 AND deletion_requested_at IS NOT NULL
+		ORDER BY deletion_requested_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Profile
+	for rows.Next() {
+		p, err := scanProfile(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ForgetProfile permanently deletes the tombstone row.
 func (d *DB) ForgetProfile(id string) error {
 	p, err := d.getProfileRow(id)
@@ -227,6 +288,8 @@ func (d *DB) ForgetProfile(id string) error {
 		`DELETE FROM profile_excludes WHERE profile_id = ?`,
 		`DELETE FROM pending_events WHERE profile_id = ?`,
 		`DELETE FROM profile_runtime WHERE profile_id = ?`,
+		`DELETE FROM profile_sync_state WHERE profile_id = ?`,
+		`DELETE FROM sync_runs WHERE profile_id = ?`,
 		`DELETE FROM manifest WHERE profile_id = ?`,
 		`DELETE FROM profiles WHERE id = ?`,
 	} {

@@ -1,5 +1,7 @@
 package state
 
+import "database/sql"
+
 // RuntimeStatus values for profile_runtime.watcher_status.
 const (
 	WatcherStopped = "stopped"
@@ -18,41 +20,18 @@ type Runtime struct {
 	WatcherStatus        string  `json:"watcher_status"`
 }
 
-type sqlNullString struct {
-	Valid bool
-	Str   string
-}
-
-func (s *sqlNullString) Scan(v any) error {
-	if v == nil {
-		s.Valid = false
-		s.Str = ""
-		return nil
-	}
-	switch t := v.(type) {
-	case []byte:
-		s.Valid = true
-		s.Str = string(t)
-	case string:
-		s.Valid = true
-		s.Str = t
-	default:
-		s.Valid = false
-	}
-	return nil
-}
-
-func nullStr(s sqlNullString) *string {
+func nullStr(s sql.NullString) *string {
 	if !s.Valid {
 		return nil
 	}
-	return &s.Str
+	return &s.String
 }
 
 func scanRuntime(row interface{ Scan(...any) error }) (*Runtime, error) {
 	var r Runtime
 	var rec int
-	var fs, rs, le, ws sqlNullString
+	var fs, rs, le sql.NullString
+	var ws string
 	if err := row.Scan(&r.ProfileID, &r.SourceGeneration, &rec, &fs, &rs, &le, &ws); err != nil {
 		return nil, err
 	}
@@ -60,7 +39,7 @@ func scanRuntime(row interface{ Scan(...any) error }) (*Runtime, error) {
 	r.LastFastSuccess = nullStr(fs)
 	r.LastReconcileSuccess = nullStr(rs)
 	r.LastError = nullStr(le)
-	r.WatcherStatus = ws.Str
+	r.WatcherStatus = ws
 	return &r, nil
 }
 
@@ -94,18 +73,6 @@ func (d *DB) BumpGeneration(profileID string) (int64, error) {
 		return 0, err
 	}
 	return r.SourceGeneration, nil
-}
-
-// RequestReconcile sets reconcile_requested=1.
-func (d *DB) RequestReconcile(profileID string) error {
-	_, err := d.Exec(`UPDATE profile_runtime SET reconcile_requested = 1 WHERE profile_id = ?`, profileID)
-	return err
-}
-
-// ClearReconcile resets reconcile_requested=0.
-func (d *DB) ClearReconcile(profileID string) error {
-	_, err := d.Exec(`UPDATE profile_runtime SET reconcile_requested = 0 WHERE profile_id = ?`, profileID)
-	return err
 }
 
 // MarkFastSuccess records a fast-sync success timestamp.

@@ -114,6 +114,84 @@ func migrate(db *sql.DB) error {
 		ALTER TABLE pending_events_new RENAME TO pending_events;
 		CREATE INDEX idx_pending_profile ON pending_events(profile_id);
 		`,
+		// v4: durable asynchronous initial sync (§7.2, §8). Adds the
+		// profile_sync_state table as the sole durable reconciliation intent
+		// authority, the sync_runs attempt/history table, and a durable
+		// deletion lifecycle gate on profiles. Existing profiles are backfilled
+		// from trustworthy durable success evidence (last_reconcile_success) per
+		// §23.1; profiles without evidence are scheduled for reconciliation so
+		// initialization evidence can be established.
+		`
+		ALTER TABLE profiles ADD COLUMN deletion_requested_at TEXT;
+		CREATE TABLE profile_sync_state (
+			profile_id TEXT PRIMARY KEY,
+			desired_generation INTEGER NOT NULL DEFAULT 0,
+			last_success_generation INTEGER,
+			initialized_at TEXT,
+			last_success_at TEXT,
+			current_run_id TEXT,
+			state TEXT NOT NULL DEFAULT 'initializing',
+			phase TEXT,
+			retry_classification TEXT,
+			consecutive_failures INTEGER NOT NULL DEFAULT 0,
+			next_retry_at TEXT,
+			last_progress_at TEXT,
+			last_error_code TEXT,
+			last_error TEXT
+		);
+		CREATE TABLE sync_runs (
+			id TEXT PRIMARY KEY,
+			profile_id TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			target_generation INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			phase TEXT,
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			files_discovered INTEGER NOT NULL DEFAULT 0,
+			files_completed INTEGER NOT NULL DEFAULT 0,
+			bytes_total INTEGER NOT NULL DEFAULT 0,
+			bytes_completed INTEGER NOT NULL DEFAULT 0,
+			last_progress_at TEXT,
+			error_code TEXT NOT NULL DEFAULT '',
+			error_classification TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT ''
+		);
+		CREATE INDEX idx_sync_runs_profile ON sync_runs(profile_id);
+		`,
+		// v5: migration-time backfill of profile_sync_state from trustworthy
+		// durable success evidence (§23.1). Profiles whose last_reconcile_success
+		// is set become initialized with last_success_generation = source_generation
+		// (the stored generation). Profiles with no durable success evidence
+		// keep last_success_generation NULL (unproven initialization) and get
+		// desired_generation advanced so a worker reconciliation establishes
+		// evidence; they are never inferred ready from profile existence.
+		`
+		INSERT OR IGNORE INTO profile_sync_state (
+			profile_id, desired_generation, last_success_generation,
+			initialized_at, last_success_at, state
+		)
+		SELECT p.id,
+			COALESCE(r.source_generation, 0),
+			CASE WHEN r.last_reconcile_success IS NULL THEN NULL ELSE COALESCE(r.source_generation, 0) END,
+			r.last_reconcile_success,
+			r.last_reconcile_success,
+			CASE WHEN r.last_reconcile_success IS NULL THEN 'initializing' ELSE 'ready' END
+		FROM profiles p
+		LEFT JOIN profile_runtime r ON r.profile_id = p.id;
+
+		UPDATE profile_sync_state SET
+			state = CASE
+				WHEN last_success_generation IS NULL THEN 'initializing'
+				WHEN desired_generation > last_success_generation THEN 'syncing'
+				ELSE 'ready'
+			END;
+
+		UPDATE profile_sync_state
+		SET desired_generation = 1
+		WHERE last_success_generation IS NULL
+			AND desired_generation = 0;
+		`,
 	}
 
 	for i, m := range migrations {
