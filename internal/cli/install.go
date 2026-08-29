@@ -42,6 +42,12 @@ func newInstallCmd() *cobra.Command {
 				}
 				installed++
 			}
+			if installed > 0 && len(targets) == 0 {
+				if err := installWorkerJob(app); err != nil {
+					return fmt.Errorf("install worker: %w", err)
+				}
+				fmt.Println("installed global worker job")
+			}
 			fmt.Printf("installed launchd jobs for %d profile(s)\n", installed)
 			return nil
 		},
@@ -80,6 +86,12 @@ func newUninstallCmd() *cobra.Command {
 					return fmt.Errorf("uninstall %s: %w", id, err)
 				}
 				fmt.Printf("uninstalled %s\n", id)
+			}
+			if all {
+				if err := uninstallWorkerJob(app); err != nil {
+					return fmt.Errorf("uninstall worker: %w", err)
+				}
+				fmt.Println("uninstalled global worker job")
 			}
 			return nil
 		},

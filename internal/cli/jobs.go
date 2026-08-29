@@ -18,6 +18,12 @@ const (
 	reconcileMin      = 37
 )
 
+// workerJobLabel is the label of the single global reconciliation worker job.
+// The worker is one process that serves all profiles (§9.5); per-profile
+// launchd jobs (watch/reconcile) complement it but never duplicate execution
+// (atomic claims prevent concurrency).
+const workerJobLabel = launchLabelPrefix + ".worker"
+
 func jobConfigs(app *App, p *state.Profile) []launchd.Config {
 	return []launchd.Config{
 		{
@@ -36,6 +42,17 @@ func jobConfigs(app *App, p *state.Profile) []launchd.Config {
 			ReconcileHour: reconcileHour,
 			ReconcileMin:  reconcileMin,
 		},
+	}
+}
+
+// workerConfig returns the global worker launchd config (no profile id).
+func workerConfig(app *App) launchd.Config {
+	return launchd.Config{
+		LabelPrefix: launchLabelPrefix,
+		ProfileID:   "",
+		Kind:        launchd.JobWorker,
+		Binary:      mustSelfPath(),
+		LogDir:      app.LogDir,
 	}
 }
 
@@ -89,6 +106,26 @@ func stopJobs(app *App, profileID string) error {
 	}
 	_ = app
 	return firstErr
+}
+
+// installWorkerJob installs and loads the global worker job.
+func installWorkerJob(app *App) error {
+	agentsDir, _ := paths.LaunchAgentsDir()
+	cfg := workerConfig(app)
+	if _, err := cfg.Install(agentsDir); err != nil {
+		return err
+	}
+	if err := cfg.Load(agentsDir); err != nil {
+		return fmt.Errorf("load %s: %w", cfg.Label(), err)
+	}
+	return nil
+}
+
+// uninstallWorkerJob removes the global worker job.
+func uninstallWorkerJob(app *App) error {
+	agentsDir, _ := paths.LaunchAgentsDir()
+	cfg := workerConfig(app)
+	return cfg.Uninstall(agentsDir)
 }
 
 func startJobs(app *App, p *state.Profile) error {

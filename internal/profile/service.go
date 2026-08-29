@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"knowledge-sync/internal/exec"
-	"knowledge-sync/internal/filter"
 	"knowledge-sync/internal/remote"
 	"knowledge-sync/internal/sidecar"
 	"knowledge-sync/internal/state"
@@ -139,18 +138,19 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 		}
 	}
 
-	// Reload excludes so initialCopy applies the structured filter (§10.1):
-	// AddExclude wrote to SQLite but p.Excludes is not updated in place.
+	// Reload excludes so subsequent operations apply the structured filter
+	// (§10.1): AddExclude wrote to SQLite but p.Excludes is not updated in
+	// place.
 	excludes, err := s.DB.GetExcludes(o.ID)
 	if err != nil {
 		return nil, err
 	}
 	p.Excludes = excludes
 
-	if err := s.initialCopy(ctx, p); err != nil {
-		return nil, fmt.Errorf("initial copy: %w", err)
-	}
-
+	// The initial full reconciliation is worker-owned and triggered by the
+	// durable generation debt recorded in CreateProfile (§24.1). `profile add`
+	// returns after committing the profile + intent; it never performs the
+	// blocking initial upload itself.
 	return p, nil
 }
 
@@ -187,77 +187,6 @@ func hasOverlap(a, b string) bool {
 	ca := strings.TrimSuffix(strings.TrimSuffix(filepath.ToSlash(a), "/"), "\\")
 	cb := strings.TrimSuffix(strings.TrimSuffix(filepath.ToSlash(b), "/"), "\\")
 	return ca == cb || strings.HasPrefix(cb, ca+"/") || strings.HasPrefix(ca, cb+"/")
-}
-
-// initialCopy performs the initial non-destructive copy-mode rollout (§21 Phase D).
-func (s *Service) initialCopy(ctx context.Context, p *state.Profile) error {
-	eng := filter.FromProfile(p)
-
-	var lines []string
-	err := filepath.Walk(p.SourcePath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if path == p.SourcePath {
-			return nil
-		}
-		rel := filter.NormalizeRelPath(p.SourcePath, path)
-		if rel == "" {
-			return nil
-		}
-		if info.IsDir() {
-			if excluded, _ := eng.Excluded(rel); excluded {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if excluded, _ := eng.Excluded(rel); excluded {
-			return nil
-		}
-		if filter.IsSymlink(path) {
-			return nil
-		}
-		if eng.OverSize(info.Size()) {
-			return nil
-		}
-		lines = append(lines, rel)
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	return s.copyFiles(ctx, p, lines)
-}
-
-// copyFiles runs rclone copy with a files-from list (no remote scan needed).
-func (s *Service) copyFiles(ctx context.Context, p *state.Profile, files []string) error {
-	if len(files) == 0 {
-		return nil
-	}
-	tmp, err := os.CreateTemp("", "ks-files-*.txt")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	for _, f := range files {
-		if _, err := fmt.Fprintln(tmp, f); err != nil {
-			tmp.Close()
-			return err
-		}
-	}
-	tmp.Close()
-
-	args := []string{
-		"copy", "--files-from", tmp.Name(),
-		"--no-traverse", "--transfers", "4",
-		p.SourcePath, p.RemoteName + ":" + p.RemoteDisplayPath,
-	}
-	res := s.Rclone.Run(ctx, args...)
-	if res.Err != nil {
-		return fmt.Errorf("initial copy: %w: %s", res.Err, res.StderrTrimmed())
-	}
-	return nil
 }
 
 func newUUID() string {

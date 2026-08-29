@@ -85,9 +85,10 @@ func runWatcher(app *App, p *state.Profile) error {
 		},
 		OnReconcile: func(ctx context.Context) error {
 			// §14: destructive events get a dedicated debounce then a full
-			// reconciliation. Reconcile is serialized by the per-profile lock;
-			// run it asynchronously so the watcher's read/debounce loops are
-			// not blocked. The hourly job remains the safety net.
+			// reconciliation. Reconciliation is serialized by the per-profile
+			// lock and routed through the atomic claim path; run it
+			// asynchronously so the watcher's read/debounce loops are not
+			// blocked. The hourly job remains the safety net.
 			lg.Printf("destructive event: scheduling full reconciliation")
 			go func() {
 				time.Sleep(reconcileDestructiveDebounce)

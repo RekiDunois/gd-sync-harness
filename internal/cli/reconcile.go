@@ -57,38 +57,66 @@ func newReconcileNowCmd() *cobra.Command {
 }
 
 func runReconcile(app *App, p *state.Profile, options sync.SyncOptions, scheduled bool) error {
-	ctx, cancel := app.Context()
-	defer cancel()
-
-	if err := validateOwnership(ctx, app, p); err != nil {
-		_ = app.DB.SetLastError(p.ID, err.Error())
-		return err
-	}
-
-	pre, err := app.reconcileForProfile(ctx, p, options)
+	// CLI entrypoints (reconcile-now, reconcile-scheduled, sync, migrate) and
+	// watch-triggered reconciles route through the same worker-owned claim and
+	// execution path. This never runs a competing transfer inside the CLI: it
+	// either claims the durable attempt or observes an existing one.
+	//
+	// force=true keeps the pre-existing safety-net semantics: the hourly
+	// scheduled reconcile and explicit reconcile-now run a full reconciliation
+	// even with no known debt (to catch remote drift), while the event-driven
+	// worker pass remains strictly debt-driven.
+	force := true
+	run, res, err := app.DB.ClaimRunMode(p.ID, newRunID(), force)
 	if err != nil {
-		_ = app.DB.SetLastError(p.ID, err.Error())
-		if err == sync.ErrDeleteBudgetExceeded {
-			return fmt.Errorf("preflight: %d expected deletions exceed budget %d; use --allow-deletes <N> to override (§16)",
-				pre.ToDelete, effectiveMaxDelete(p, options))
+		return err
+	}
+	switch res {
+	case state.ClaimOK:
+		return executeReconcileAttempt(app, p, run, options, scheduled, nil)
+	case state.ClaimActiveRun:
+		// An active run already owns the profile; request a newer desired
+		// generation so a follow-up reconciliation is eligible (§18.4).
+		_ = app.DB.RequestReconcile(p.ID)
+		return fmt.Errorf("reconciliation already running for %q; follow-up generation requested", p.ID)
+	case state.ClaimGateBlocked:
+		// A terminal/retry gate blocks automatic claims. Only explicit manual
+		// requests (reconcile-now) reopen eligibility; scheduled safety-net
+		// runs and watch-triggered destructive reconciles respect the gate
+		// because ordinary filesystem events must not clear terminal errors
+		// (§18.4, §20).
+		if scheduled {
+			return fmt.Errorf("reconciliation for %q is gated (%s); run 'knowledge-sync sync %s' to reopen eligibility",
+				p.ID, gateReason(app, p.ID), p.ID)
 		}
-		return err
+		if err := app.DB.ReopenSyncGate(p.ID); err != nil {
+			return err
+		}
+		run, res, err = app.DB.ClaimRunMode(p.ID, newRunID(), force)
+		if err != nil {
+			return err
+		}
+		if res == state.ClaimOK {
+			return executeReconcileAttempt(app, p, run, options, scheduled, nil)
+		}
+		return fmt.Errorf("reconciliation gate re-opened but claim rejected")
+	case state.ClaimNoDebt:
+		if !scheduled {
+			fmt.Printf("reconcile %s: nothing to reconcile\n", p.ID)
+		}
+		return nil
+	case state.ClaimProfileInactive:
+		return fmt.Errorf("profile %q is not eligible for reconciliation (disabled, tombstoned, or deleting)", p.ID)
 	}
+	return fmt.Errorf("unexpected claim result")
+}
 
-	if err := refreshManifest(app.DB, p, pre); err != nil {
-		return err
+func gateReason(app *App, id string) string {
+	ss, err := app.DB.GetSyncState(id)
+	if err != nil || ss.RetryClassification == nil {
+		return "gate blocked"
 	}
-	if err := app.DB.MarkReconcileSuccess(p.ID); err != nil {
-		return err
-	}
-	if err := app.DB.ClearPending(p.ID); err != nil {
-		return err
-	}
-	if !scheduled {
-		fmt.Printf("reconcile %s: %d source files, %d copies, %d deletions\n",
-			p.ID, pre.SourceFiles, pre.ToCopy, pre.ToDelete)
-	}
-	return nil
+	return *ss.RetryClassification
 }
 
 func effectiveMaxDelete(p *state.Profile, o sync.SyncOptions) int {

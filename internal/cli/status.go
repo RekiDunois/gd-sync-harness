@@ -69,7 +69,8 @@ func renderProfileStatus(app *App, p *state.Profile) error {
 	if err != nil {
 		return err
 	}
-	health := computeHealth(app, p, rt)
+	ss, _ := app.DB.GetSyncState(p.ID)
+	health := computeHealth(app, p, rt, ss)
 	pending, _ := app.DB.CountPending(p.ID)
 	manifestCount, _ := app.DB.ManifestCount(p.ID)
 
@@ -84,6 +85,22 @@ func renderProfileStatus(app *App, p *state.Profile) error {
 	fmt.Printf("  watcher:           %s\n", rt.WatcherStatus)
 	fmt.Printf("  pending events:    %d\n", pending)
 	fmt.Printf("  manifest entries:  %d\n", manifestCount)
+	if ss != nil {
+		fmt.Printf("  sync state:        %s", ss.State)
+		if ss.Phase != "" {
+			fmt.Printf(" (%s)", ss.Phase)
+		}
+		fmt.Println()
+		if ss.IsInitialized() && ss.InitializedAt != nil {
+			fmt.Printf("  initialized:       %s\n", *ss.InitializedAt)
+		}
+		if ss.LastSuccessAt != nil {
+			fmt.Printf("  last successful:   %s\n", *ss.LastSuccessAt)
+		}
+		if ss.CurrentRunID != nil {
+			fmt.Printf("  active run:        %s\n", *ss.CurrentRunID)
+		}
+	}
 	if scanErr == nil {
 		fmt.Printf("  local files:       %d (symlinks skipped: %d, oversize skipped: %d)\n",
 			len(scan.Entries), len(scan.SkippedSymlinks), len(scan.SkippedOversize))
@@ -124,15 +141,28 @@ func humanBytes(b int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-func computeHealth(app *App, p *state.Profile, rt *state.Runtime) string {
+func computeHealth(app *App, p *state.Profile, rt *state.Runtime, ss *state.ProfileSyncState) string {
 	if p.Tombstoned {
 		return "TOMBSTONED"
+	}
+	if p.DeletionRequestedAt != nil {
+		return "DELETING"
 	}
 	if !p.Enabled {
 		return "DISABLED"
 	}
 	if rt == nil {
 		return "STALE"
+	}
+	if ss != nil {
+		switch ss.State {
+		case state.StateInitializing:
+			return "INITIALIZING"
+		case state.StateSyncing:
+			return "SYNCING"
+		case state.StateError:
+			return "BROKEN"
+		}
 	}
 	if rt.ReconcileRequested {
 		return "RECONCILE_REQUESTED"

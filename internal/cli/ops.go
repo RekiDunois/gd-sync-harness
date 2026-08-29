@@ -102,6 +102,7 @@ func newStopCmd() *cobra.Command {
 				}
 				count++
 			}
+			_ = uninstallWorkerJob(app)
 			fmt.Printf("stopped jobs for %d profile(s); remote data untouched\n", count)
 			return nil
 		},

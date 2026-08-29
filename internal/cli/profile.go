@@ -22,6 +22,8 @@ func newProfileCmd() *cobra.Command {
 		profileAddCmd(),
 		profileShowCmd(),
 		profileListCmd(),
+		profileStatusCmd(),
+		newProfileWaitCmd(),
 		profileDisableCmd(),
 		profileEnableCmd(),
 		profileRemoveCmd(),
@@ -39,6 +41,7 @@ func profileAddCmd() *cobra.Command {
 		maxDelete   int
 		maxFileSize int64
 		dryRun      bool
+		wait        bool
 	)
 	c := &cobra.Command{
 		Use:   "add <id> <source> <remote> <remote-path>",
@@ -67,12 +70,29 @@ func profileAddCmd() *cobra.Command {
 				return err
 			}
 			backupNow(app)
-			fmt.Printf("added profile %s (uuid %s)\n", p.ID, p.ProfileUUID)
+			fmt.Printf("Profile %q created.\n", p.ID)
 			fmt.Printf("  source:   %s\n", p.SourcePath)
 			fmt.Printf("  remote:   %s:%s\n", p.RemoteName, p.RemoteDisplayPath)
 			fmt.Printf("  folder:   %s\n", p.RemoteFolderID)
 			fmt.Printf("  type:     %s\n", p.Type)
-			fmt.Printf("  max_delete: %d\n", p.MaxDelete)
+			if dryRun {
+				fmt.Println("  dry-run:  no remote root, sidecar, or database row created")
+				return nil
+			}
+			fmt.Println("Initial sync queued.")
+			fmt.Println()
+			fmt.Println("Check progress:")
+			fmt.Printf("  knowledge-sync profile status %s\n", p.ID)
+			if wait {
+				fmt.Println()
+				if err := waitForReady(app, p.ID); err != nil {
+					return fmt.Errorf("profile %q was created successfully; synchronization did not reach ready: %w\n\n"+
+						"The profile has been kept.\nInspect or retry with:\n"+
+						"  knowledge-sync profile status %s\n  knowledge-sync sync %s",
+						p.ID, err, p.ID, p.ID)
+				}
+				fmt.Printf("Initial sync complete.\nProfile state: ready\n")
+			}
 			return nil
 		},
 	}
@@ -80,6 +100,7 @@ func profileAddCmd() *cobra.Command {
 	c.Flags().IntVar(&maxDelete, "max-delete", 0, "per-profile deletion budget (default 100)")
 	c.Flags().Int64Var(&maxFileSize, "max-file-size", 0, "max file size in bytes (default 512 MiB; 0 = unlimited)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "validate only; do not create remote root or sidecar")
+	c.Flags().BoolVar(&wait, "wait", false, "wait for initial sync to reach ready (worker-owned)")
 	return c
 }
 
@@ -226,7 +247,7 @@ func profileRemoveCmd() *cobra.Command {
 	var force bool
 	c := &cobra.Command{
 		Use:   "remove <id>",
-		Short: "Remove a profile (tombstone; keeps remote data)",
+		Short: "Request removal of a profile (durable async deletion; keeps remote data)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, err := NewApp()
@@ -238,24 +259,34 @@ func profileRemoveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if p.DeletionRequestedAt != nil {
+				return fmt.Errorf("profile %q deletion already requested", p.ID)
+			}
 			return app.withProfileLock(p, func() error {
 				if err := stopJobs(app, p.ID); err != nil {
 					if !force {
 						return err
 					}
 				}
-				if err := app.DB.ClearPending(p.ID); err != nil {
-					return err
-				}
-				if err := app.DB.TombstoneProfile(p.ID); err != nil {
+				// Persist deletion intent before returning success (§19). New
+				// reconciliation claims are blocked from this point; final row
+				// removal is serialized behind any active run by the worker.
+				if err := app.DB.RequestProfileDeletion(p.ID); err != nil {
 					return err
 				}
 				backupNow(app)
+				fmt.Printf("Profile %q deletion requested.\n", p.ID)
+				ss, _ := app.DB.GetSyncState(p.ID)
+				if ss != nil && ss.CurrentRunID != nil {
+					fmt.Println("An active sync is finishing before removal.")
+				} else {
+					fmt.Println("Removal will finalize shortly.")
+				}
 				return nil
 			})
 		},
 	}
-	c.Flags().BoolVar(&force, "force", false, "tombstone even if job uninstall fails")
+	c.Flags().BoolVar(&force, "force", false, "request deletion even if job uninstall fails")
 	return c
 }
 
@@ -281,6 +312,11 @@ func profileRestoreCmd() *cobra.Command {
 				return fmt.Errorf("source missing: %w", err)
 			}
 			if err := app.DB.RestoreProfile(p.ID); err != nil {
+				return err
+			}
+			// Re-establish durable reconciliation intent so the worker knows the
+			// restored profile needs convergence to re-verify initialization.
+			if err := app.DB.RequestReconcile(p.ID); err != nil {
 				return err
 			}
 			backupNow(app)

@@ -8,12 +8,13 @@ import (
 	"text/template"
 )
 
-// JobKind distinguishes the two per-profile jobs.
+// JobKind distinguishes the per-profile jobs.
 type JobKind string
 
 const (
 	JobWatch     JobKind = "watch"
 	JobReconcile JobKind = "reconcile"
+	JobWorker    JobKind = "worker"
 )
 
 // Config holds everything needed to render a plist.
@@ -27,8 +28,12 @@ type Config struct {
 	ReconcileMin  int
 }
 
-// Label returns the launchd job label.
+// Label returns the launchd job label. For global jobs (worker, no profile)
+// the label omits the profile segment.
 func (c Config) Label() string {
+	if c.ProfileID == "" {
+		return fmt.Sprintf("%s.%s", c.LabelPrefix, c.Kind)
+	}
 	return fmt.Sprintf("%s.%s.%s", c.LabelPrefix, c.ProfileID, c.Kind)
 }
 
@@ -57,9 +62,9 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	<key>WorkingDirectory</key>
 	<string>/</string>
 	<key>RunAtLoad</key>
-	{{if eq .Kind "watch"}}<true/>{{else}}<false/>{{end}}
+	{{if eq .Kind "watch"}}<true/>{{else if eq .Kind "worker"}}<true/>{{else}}<false/>{{end}}
 	<key>KeepAlive</key>
-	{{if eq .Kind "watch"}}<true/>{{else}}<false/>{{end}}
+	{{if eq .Kind "watch"}}<true/>{{else if eq .Kind "worker"}}<true/>{{else}}<false/>{{end}}
 	<key>StandardOutPath</key>
 	<string>{{.LogDir}}/{{.ProfileID}}.{{.Kind}}.log</string>
 	<key>StandardErrorPath</key>

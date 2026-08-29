@@ -71,3 +71,35 @@ func TestReconcilePlistRender(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerLabelAndPlistRender(t *testing.T) {
+	c := Config{
+		LabelPrefix: "com.local.knowledge-sync",
+		ProfileID:   "",
+		Kind:        JobWorker,
+		Binary:      "/usr/local/bin/knowledge-sync",
+		LogDir:      "/Users/x/Library/Logs/knowledge-sync",
+	}
+	if c.Label() != "com.local.knowledge-sync.worker" {
+		t.Fatalf("worker label = %q", c.Label())
+	}
+	b, err := c.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		"com.local.knowledge-sync.worker",
+		"<key>RunAtLoad</key>",
+		"<true/>",
+		"<key>KeepAlive</key>",
+		"worker",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("worker plist missing %q\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "StartCalendarInterval") {
+		t.Error("worker plist should not have StartCalendarInterval")
+	}
+}
