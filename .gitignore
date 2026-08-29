@@ -1,0 +1,28 @@
+# SQLite state database (local control plane)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.bak
+*.sqlite.bak-*
+
+# Local state/data directories
+.local/
+state/
+data/
+
+# OAuth credentials and rclone config (never commit secrets)
+rclone.conf
+
+# Build artifacts
+/bin/
+*.exe
+*.dylib
+*.test
+coverage.out
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
