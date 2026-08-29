@@ -133,6 +133,52 @@ Elapsed time:         0.1s`
 	}
 }
 
+// TestExcludeChangeRemovesRemote validates §17: a previously mirrored file that
+// becomes excluded must be removed by the next full reconciliation, and the
+// delete must be counted in preflight so the budget protects it.
+func TestExcludeChangeRemovesRemote(t *testing.T) {
+	r, _ := mockRclone(t)
+	ctx := context.Background()
+	src := filepath.Join(t.TempDir(), "src")
+	mkdirAll(t, src)
+	mkfile(t, src, "keep.md", "k")
+	mkfile(t, src, "tmp.bin", "t")
+
+	p := newTestProfile(t, src, "mock", "mirror")
+	svc := New(r, nil)
+
+	// Initial full sync mirrors both.
+	if err := svc.FullSync(ctx, p, SyncOptions{}); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	if readRemote(t, r, "mock", "mirror/tmp.bin") != "t" {
+		t.Fatal("tmp.bin should be mirrored initially")
+	}
+
+	// Now exclude *.bin (simulates a filter change).
+	p.Excludes = append(p.Excludes, "exclude_extension:bin")
+
+	// Dry-run must predict the removal (with --delete-excluded).
+	dry, err := svc.DryRunSync(ctx, p, SyncOptions{})
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if dry.ToDelete < 1 {
+		t.Fatalf("preflight should predict removal of excluded file; deleted=%d", dry.ToDelete)
+	}
+
+	// Live sync removes it.
+	if err := svc.FullSync(ctx, p, SyncOptions{}); err != nil {
+		t.Fatalf("sync after exclude: %v", err)
+	}
+	if readRemote(t, r, "mock", "mirror/tmp.bin") != "" {
+		t.Fatal("excluded tmp.bin should be removed from remote (§17)")
+	}
+	if readRemote(t, r, "mock", "mirror/keep.md") != "k" {
+		t.Fatal("keep.md should remain")
+	}
+}
+
 func readRemote(t *testing.T, r *exec.Rclone, remote, path string) string {
 	t.Helper()
 	tmp := filepath.Join(t.TempDir(), "f")

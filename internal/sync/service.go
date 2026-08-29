@@ -47,13 +47,42 @@ func (s *Service) FastUpsert(ctx context.Context, p *state.Profile, files []stri
 	return nil
 }
 
+// sourceFilesFrom builds a files-from list containing exactly the eligible
+// source files under the structured filter (§10.1). It is used by both dry-run
+// and live full reconciliation so the mirror honors excludes/max-size and, with
+// sync semantics, removes previously-mirrored files that became excluded (§17).
+func (s *Service) sourceFilesFrom(p *state.Profile) (string, []string, error) {
+	scan, err := ScanLocal(p)
+	if err != nil {
+		return "", nil, err
+	}
+	paths := make([]string, 0, len(scan.Entries))
+	for _, e := range scan.Entries {
+		paths = append(paths, e.RelPath)
+	}
+	list, err := writeFilesFrom(paths)
+	if err != nil {
+		return "", nil, err
+	}
+	return list, paths, nil
+}
+
 // DryRunSync performs rclone sync in dry-run mode to compute the destructive
-// plan without mutating the remote. rclone writes the summary to stderr, so we
-// combine stdout+stderr for parsing.
+// plan without mutating the remote. It uses the structured-filter files-from
+// list so the plan reflects the true mirror semantics. rclone writes the
+// summary to stderr, so we combine stdout+stderr for parsing.
 func (s *Service) DryRunSync(ctx context.Context, p *state.Profile, options SyncOptions) (*PreflightResult, error) {
+	list, _, err := s.sourceFilesFrom(p)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(list)
+
 	args := []string{
 		"sync",
 		"--dry-run",
+		"--files-from", list,
+		"--delete-excluded",
 		"--fast-list",
 		"--track-renames",
 		p.SourcePath,
@@ -116,10 +145,20 @@ func parseLeadingInt(s string) (int, error) {
 	return sign * n, nil
 }
 
-// FullSync runs the live destructive reconciliation (§15).
+// FullSync runs the live destructive reconciliation (§15). It uses the same
+// structured-filter files-from list as preflight so excludes and max-size are
+// enforced on the source side and excluded remote objects are removed (§17).
 func (s *Service) FullSync(ctx context.Context, p *state.Profile, options SyncOptions) error {
+	list, _, err := s.sourceFilesFrom(p)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(list)
+
 	args := []string{
 		"sync",
+		"--files-from", list,
+		"--delete-excluded",
 		"--fast-list",
 		"--track-renames",
 		fmt.Sprintf("--max-delete=%d", effectiveDeleteLimit(p, options)),

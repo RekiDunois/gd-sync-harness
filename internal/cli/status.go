@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"knowledge-sync/internal/state"
+	"knowledge-sync/internal/sync"
 )
 
 func newStatusCmd() *cobra.Command {
@@ -72,6 +73,9 @@ func renderProfileStatus(app *App, p *state.Profile) error {
 	pending, _ := app.DB.CountPending(p.ID)
 	manifestCount, _ := app.DB.ManifestCount(p.ID)
 
+	// §10.4: report skipped symlinks and oversize files in status.
+	scan, scanErr := sync.ScanLocal(p)
+
 	fmt.Printf("%s  [%s]\n", p.ID, health)
 	fmt.Printf("  type:              %s\n", p.Type)
 	fmt.Printf("  source:            %s\n", p.SourcePath)
@@ -80,6 +84,10 @@ func renderProfileStatus(app *App, p *state.Profile) error {
 	fmt.Printf("  watcher:           %s\n", rt.WatcherStatus)
 	fmt.Printf("  pending events:    %d\n", pending)
 	fmt.Printf("  manifest entries:  %d\n", manifestCount)
+	if scanErr == nil {
+		fmt.Printf("  local files:       %d (symlinks skipped: %d, oversize skipped: %d)\n",
+			len(scan.Entries), len(scan.SkippedSymlinks), len(scan.SkippedOversize))
+	}
 	fmt.Printf("  last fast sync:    %s\n", nullOr(rt.LastFastSuccess))
 	fmt.Printf("  last reconcile:    %s\n", nullOr(rt.LastReconcileSuccess))
 	fmt.Printf("  last error:        %s\n", nullOr(rt.LastError))
@@ -89,6 +97,16 @@ func renderProfileStatus(app *App, p *state.Profile) error {
 	if q, err := app.DB.GetRemote(p.RemoteName); err == nil && q.LastQuotaCheck != "" {
 		fmt.Printf("  quota %s:         %s used / %s total / %s free [%s]\n",
 			p.RemoteName, humanBytes(q.UsedBytes), humanBytes(q.TotalBytes), humanBytes(q.FreeBytes), q.QuotaStatus)
+	}
+	if scanErr == nil && len(scan.SkippedSymlinks) > 0 {
+		fmt.Println("  skipped symlinks (§10.4):")
+		for i, s := range scan.SkippedSymlinks {
+			if i >= 10 {
+				fmt.Printf("    ... and %d more\n", len(scan.SkippedSymlinks)-10)
+				break
+			}
+			fmt.Printf("    %s\n", s)
+		}
 	}
 	return nil
 }
