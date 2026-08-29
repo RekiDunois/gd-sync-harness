@@ -6,14 +6,20 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"knowledge-sync/internal/filter"
 	"knowledge-sync/internal/logger"
 	"knowledge-sync/internal/state"
+	"knowledge-sync/internal/sync"
 	"knowledge-sync/internal/watch"
 )
+
+// reconcileDestructiveDebounce is the §14 settle delay before a destructive
+// event triggers full reconciliation (RECONCILE_SETTLE_SECONDS).
+const reconcileDestructiveDebounce = 10 * time.Second
 
 func newWatchCmd() *cobra.Command {
 	return &cobra.Command{
@@ -78,7 +84,17 @@ func runWatcher(app *App, p *state.Profile) error {
 			return nil
 		},
 		OnReconcile: func(ctx context.Context) error {
-			lg.Printf("destructive event: scheduling reconciliation")
+			// §14: destructive events get a dedicated debounce then a full
+			// reconciliation. Reconcile is serialized by the per-profile lock;
+			// run it asynchronously so the watcher's read/debounce loops are
+			// not blocked. The hourly job remains the safety net.
+			lg.Printf("destructive event: scheduling full reconciliation")
+			go func() {
+				time.Sleep(reconcileDestructiveDebounce)
+				if err := runReconcile(app, p, sync.SyncOptions{}, true); err != nil {
+					lg.Printf("destructive reconcile: %v", err)
+				}
+			}()
 			return nil
 		},
 	}
