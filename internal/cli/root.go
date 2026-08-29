@@ -39,22 +39,10 @@ func (a *App) Context() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 30*time.Minute)
 }
 
-// NewApp initializes the shared app from the environment.
+// NewApp initializes the shared app from the environment. Tool paths are read
+// from persisted settings first (so launchd jobs do not depend on interactive
+// PATH, §31.2), falling back to exec.LookPath, then persisted for next time.
 func NewApp() (*App, error) {
-	rcloneBin, err := exec.LookPath("rclone")
-	if err != nil {
-		return nil, fmt.Errorf("rclone not found: %w (run 'knowledge-sync doctor')", err)
-	}
-	fswatchBin, _ := exec.LookPath("fswatch")
-
-	probe := rcexec.NewRclone(rcloneBin, "")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	configPath, err := probe.DiscoverConfigPath(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("discover rclone config: %w", err)
-	}
-
 	if err := paths.Ensure(); err != nil {
 		return nil, err
 	}
@@ -63,6 +51,29 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+
+	rcloneBin, err := resolveToolFromDB(db, "rclone")
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("rclone not found: %w (run 'knowledge-sync doctor')", err)
+	}
+	fswatchBin, _ := resolveToolFromDB(db, "fswatch")
+
+	probe := rcexec.NewRclone(rcloneBin, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	configPath, err := probe.DiscoverConfigPath(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("discover rclone config: %w", err)
+	}
+
+	// Persist resolved tool paths so launchd-spawned processes reuse them.
+	_ = db.SetSetting(state.SettingRcloneBin, rcloneBin)
+	if fswatchBin != "" {
+		_ = db.SetSetting(state.SettingFSWatchBin, fswatchBin)
+	}
+	_ = db.SetSetting(state.SettingRcloneCfg, configPath)
 
 	rclone := rcexec.NewRclone(rcloneBin, configPath)
 	rm := remote.New(rclone, db)
@@ -76,6 +87,24 @@ func NewApp() (*App, error) {
 		ConfigPath: configPath, RcloneBin: rcloneBin, FSWatchBin: fswatchBin,
 		LogDir: logDir, scheduler: newSyncScheduler(),
 	}, nil
+}
+
+// resolveToolFromDB resolves a binary path from persisted settings first,
+// falling back to PATH lookup.
+func resolveToolFromDB(db *state.DB, name string) (string, error) {
+	key := ""
+	switch name {
+	case "rclone":
+		key = state.SettingRcloneBin
+	case "fswatch":
+		key = state.SettingFSWatchBin
+	}
+	if key != "" {
+		if v, _ := db.GetSetting(key); v != "" {
+			return v, nil
+		}
+	}
+	return exec.LookPath(name)
 }
 
 // Close releases the database handle.

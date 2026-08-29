@@ -1,0 +1,270 @@
+package state
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+)
+
+var (
+	ErrNotFound      = errors.New("not found")
+	ErrIDExists      = errors.New("profile id already exists")
+	ErrIDTombstoned  = errors.New("profile id is tombstoned; use forget or restore")
+	ErrNotTombstoned = errors.New("profile is not tombstoned")
+)
+
+// Profile is the canonical profile configuration record.
+type Profile struct {
+	ID                string   `json:"id"`
+	ProfileUUID       string   `json:"profile_uuid"`
+	Type              string   `json:"type"` // "obsidian" | "generic"
+	SourcePath        string   `json:"source_path"`
+	RemoteName        string   `json:"remote_name"`
+	RemoteFolderID    string   `json:"remote_folder_id"`
+	RemoteDisplayPath string   `json:"remote_display_path"`
+	Enabled           bool     `json:"enabled"`
+	MaxDelete         int      `json:"max_delete"`
+	MaxFileSize       int64    `json:"max_file_size"` // bytes; 0 = unlimited
+	DeletedAt         *string  `json:"deleted_at,omitempty"`
+	Tombstoned        bool     `json:"tombstoned"`
+	Excludes          []string `json:"excludes"`
+}
+
+// scanProfile scans a full profile row (excludes loaded separately).
+func scanProfile(row *sql.Row) (*Profile, error) {
+	var p Profile
+	var enabled, tomb int
+	var deleted sql.NullString
+	if err := row.Scan(
+		&p.ID, &p.ProfileUUID, &p.Type, &p.SourcePath, &p.RemoteName,
+		&p.RemoteFolderID, &p.RemoteDisplayPath, &enabled, &p.MaxDelete,
+		&p.MaxFileSize, &deleted, &tomb,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	p.Enabled = enabled == 1
+	p.Tombstoned = tomb == 1
+	if deleted.Valid {
+		p.DeletedAt = &deleted.String
+	}
+	return &p, nil
+}
+
+const profileCols = `id, profile_uuid, type, source_path, remote_name,
+	remote_folder_id, remote_display_path, enabled, max_delete, max_file_size,
+	deleted_at, tombstoned`
+
+// GetProfile returns a profile by ID (tombstoned or not).
+func (d *DB) GetProfile(id string) (*Profile, error) {
+	p, err := d.getProfileRow(id)
+	if err != nil {
+		return nil, err
+	}
+	excludes, err := d.GetExcludes(id)
+	if err != nil {
+		return nil, err
+	}
+	p.Excludes = excludes
+	return p, nil
+}
+
+func (d *DB) getProfileRow(id string) (*Profile, error) {
+	return scanProfile(d.QueryRow(`SELECT `+profileCols+` FROM profiles WHERE id = ?`, id))
+}
+
+// ListProfiles returns all profiles sorted by id.
+func (d *DB) ListProfiles() ([]*Profile, error) {
+	rows, err := d.Query(`SELECT ` + profileCols + ` FROM profiles ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Profile
+	for rows.Next() {
+		var p Profile
+		var enabled, tomb int
+		var deleted sql.NullString
+		if err := rows.Scan(
+			&p.ID, &p.ProfileUUID, &p.Type, &p.SourcePath, &p.RemoteName,
+			&p.RemoteFolderID, &p.RemoteDisplayPath, &enabled, &p.MaxDelete,
+			&p.MaxFileSize, &deleted, &tomb,
+		); err != nil {
+			return nil, err
+		}
+		p.Enabled = enabled == 1
+		p.Tombstoned = tomb == 1
+		if deleted.Valid {
+			p.DeletedAt = &deleted.String
+		}
+		out = append(out, &p)
+	}
+	return out, rows.Err()
+}
+
+// ActiveProfiles returns non-tombstoned profiles.
+func (d *DB) ActiveProfiles() ([]*Profile, error) {
+	all, err := d.ListProfiles()
+	if err != nil {
+		return nil, err
+	}
+	var out []*Profile
+	for _, p := range all {
+		if !p.Tombstoned {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// CreateProfile inserts a new profile, rejecting duplicate and tombstoned IDs.
+func (d *DB) CreateProfile(p *Profile) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM profiles WHERE id = ?`, p.ID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists > 0 {
+		var tomb int
+		if err := tx.QueryRow(`SELECT tombstoned FROM profiles WHERE id = ?`, p.ID).Scan(&tomb); err != nil {
+			return err
+		}
+		if tomb == 1 {
+			return ErrIDTombstoned
+		}
+		return ErrIDExists
+	}
+
+	now := Now().Format(timeFmt)
+	enabled := boolInt(p.Enabled)
+	tomb := boolInt(p.Tombstoned)
+	var deleted interface{}
+	if p.DeletedAt != nil {
+		deleted = *p.DeletedAt
+	}
+	if _, err := tx.Exec(`INSERT INTO profiles (
+		id, profile_uuid, type, source_path, remote_name, remote_folder_id,
+		remote_display_path, enabled, max_delete, max_file_size, deleted_at,
+		tombstoned, created_at, updated_at
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.ID, p.ProfileUUID, p.Type, p.SourcePath, p.RemoteName,
+		p.RemoteFolderID, p.RemoteDisplayPath, enabled, p.MaxDelete,
+		p.MaxFileSize, deleted, tomb, now, now,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO profile_runtime (profile_id) VALUES (?)`, p.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UpdateProfileFields updates mutable config fields on an existing profile.
+func (d *DB) UpdateProfileFields(p *Profile) error {
+	_, err := d.Exec(`UPDATE profiles SET
+		type = ?, source_path = ?, remote_name = ?, remote_folder_id = ?,
+		remote_display_path = ?, enabled = ?, max_delete = ?, max_file_size = ?,
+		updated_at = ?
+		WHERE id = ?`,
+		p.Type, p.SourcePath, p.RemoteName, p.RemoteFolderID,
+		p.RemoteDisplayPath, boolInt(p.Enabled), p.MaxDelete, p.MaxFileSize,
+		Now().Format(timeFmt), p.ID,
+	)
+	return err
+}
+
+// SetProfileEnabled flips the enabled flag.
+func (d *DB) SetProfileEnabled(id string, enabled bool) error {
+	res, err := d.Exec(`UPDATE profiles SET enabled = ?, updated_at = ? WHERE id = ?`,
+		boolInt(enabled), Now().Format(timeFmt), id)
+	if err != nil {
+		return err
+	}
+	return checkRows(res)
+}
+
+// TombstoneProfile marks a profile deleted (soft delete), clearing enabled.
+func (d *DB) TombstoneProfile(id string) error {
+	now := Now().Format(timeFmt)
+	res, err := d.Exec(`UPDATE profiles SET enabled = 0, deleted_at = ?, tombstoned = 1, updated_at = ? WHERE id = ?`,
+		now, now, id)
+	if err != nil {
+		return err
+	}
+	return checkRows(res)
+}
+
+// RestoreProfile clears tombstone state on a deleted profile.
+func (d *DB) RestoreProfile(id string) error {
+	_, err := d.Exec(`UPDATE profiles SET tombstoned = 0, deleted_at = NULL, updated_at = ? WHERE id = ?`,
+		Now().Format(timeFmt), id)
+	return err
+}
+
+// ForgetProfile permanently deletes the tombstone row.
+func (d *DB) ForgetProfile(id string) error {
+	p, err := d.getProfileRow(id)
+	if err != nil {
+		return err
+	}
+	if !p.Tombstoned {
+		return ErrNotTombstoned
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM profile_excludes WHERE profile_id = ?`,
+		`DELETE FROM pending_events WHERE profile_id = ?`,
+		`DELETE FROM profile_runtime WHERE profile_id = ?`,
+		`DELETE FROM manifest WHERE profile_id = ?`,
+		`DELETE FROM profiles WHERE id = ?`,
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func checkRows(res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ValidateID implements the recommended ID grammar [a-z0-9][a-z0-9-]*.
+func ValidateID(id string) error {
+	if len(id) == 0 {
+		return errors.New("profile id must not be empty")
+	}
+	for i, r := range id {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || (r == '-' && i > 0)
+		if !ok {
+			return fmt.Errorf("invalid profile id %q: must match [a-z0-9][a-z0-9-]*", id)
+		}
+	}
+	return nil
+}

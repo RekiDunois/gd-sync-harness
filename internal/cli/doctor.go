@@ -25,8 +25,8 @@ func newDoctorCmd() *cobra.Command {
 			}
 			defer app.Close()
 			fmt.Println("knowledge-sync doctor")
-			fmt.Printf("  rclone:            %s\n", execPath("rclone"))
-			fmt.Printf("  fswatch:           %s\n", execPath("fswatch"))
+			fmt.Printf("  rclone:            %s\n", displayPath(app.RcloneBin))
+			fmt.Printf("  fswatch:           %s\n", displayPath(app.FSWatchBin))
 			fmt.Printf("  rclone config:     %s\n", app.ConfigPath)
 			dbPath, _ := paths.DBPath()
 			fmt.Printf("  sqlite database:   %s\n", dbPath)
@@ -59,6 +59,13 @@ func newDoctorCmd() *cobra.Command {
 func execPath(name string) string {
 	p, err := exec.LookPath(name)
 	if err != nil {
+		return "(not found)"
+	}
+	return p
+}
+
+func displayPath(p string) string {
+	if p == "" {
 		return "(not found)"
 	}
 	return p

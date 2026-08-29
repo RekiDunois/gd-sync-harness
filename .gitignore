@@ -5,10 +5,10 @@
 *.sqlite.bak
 *.sqlite.bak-*
 
-# Local state/data directories
-.local/
-state/
-data/
+# Local state/data directories (root-level only, not internal/state source)
+/.local/
+/state/
+/data/
 
 # OAuth credentials and rclone config (never commit secrets)
 rclone.conf

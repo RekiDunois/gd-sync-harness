@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -50,12 +51,19 @@ type Watcher struct {
 	firstSeen map[string]time.Time
 }
 
-// Start launches fswatch and begins reading events.
+// Start launches fswatch and begins reading events. SourcePath is resolved to
+// its physical path (macOS /tmp → /private/tmp) so fswatch event paths match
+// the source prefix exactly (§11).
 func (w *Watcher) Start(ctx context.Context) error {
 	w.mu.Lock()
 	w.done = make(chan struct{})
 	w.firstSeen = make(map[string]time.Time)
 	w.mu.Unlock()
+
+	// Resolve symlinks so event paths from fswatch line up with SourcePath.
+	if resolved, err := filepath.EvalSymlinks(w.SourcePath); err == nil {
+		w.SourcePath = resolved
+	}
 
 	cctx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
@@ -134,11 +142,11 @@ func (w *Watcher) readLoop(ctx context.Context, stdout io.ReadCloser) {
 }
 
 func (w *Watcher) handleEvent(ctx context.Context, path string) {
-	rel := strings.TrimPrefix(path, w.SourcePath+"/")
-	if rel == path || rel == "" {
+	rel := relPathUnder(w.SourcePath, path)
+	if rel == "" {
 		return
 	}
-	kind := w.classify(path)
+	kind := w.classify(path, rel)
 	if kind == "" {
 		return
 	}
@@ -158,12 +166,8 @@ func (w *Watcher) handleEvent(ctx context.Context, path string) {
 }
 
 // classify converts a path to an event kind, or "" if excluded by the
-// structured filter (§10.1).
-func (w *Watcher) classify(path string) string {
-	rel := strings.TrimPrefix(path, w.SourcePath+"/")
-	if rel == path || rel == "" {
-		return ""
-	}
+// structured filter (§10.1). rel is the path relative to the profile source.
+func (w *Watcher) classify(path, rel string) string {
 	if w.Filter != nil {
 		if excluded, _ := w.Filter.Excluded(rel); excluded {
 			return ""
@@ -270,4 +274,31 @@ func splitNUL(data []byte, atEOF bool) (advance int, token []byte, err error) {
 		return len(data), data, nil
 	}
 	return 0, nil, nil
+}
+
+// relPathUnder returns the slash-separated path of `path` relative to `source`.
+// It tolerates macOS /tmp vs /private/tmp style symlink discrepancies by
+// resolving the event's directory prefix when the direct prefix match fails
+// (the file itself may already be deleted, so we resolve the parent dir).
+func relPathUnder(source, path string) string {
+	rel := strings.TrimPrefix(path, source+"/")
+	if rel != path && rel != "" {
+		return rel
+	}
+	// Direct prefix failed: resolve the event's parent directory symlinks.
+	if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		resolved := filepath.Join(resolvedDir, filepath.Base(path))
+		rel = strings.TrimPrefix(resolved, source+"/")
+		if rel != resolved && rel != "" {
+			return rel
+		}
+	}
+	// Also try the reverse: event came in resolved form but source is not.
+	if resolvedSrc, err := filepath.EvalSymlinks(source); err == nil {
+		rel = strings.TrimPrefix(path, resolvedSrc+"/")
+		if rel != path && rel != "" {
+			return rel
+		}
+	}
+	return ""
 }
