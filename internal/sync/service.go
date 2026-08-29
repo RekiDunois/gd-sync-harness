@@ -9,7 +9,6 @@ import (
 	"knowledge-sync/internal/exec"
 	"knowledge-sync/internal/state"
 )
-
 // Service performs fast-path upserts and full reconciliation through rclone.
 type Service struct {
 	Rclone *exec.Rclone
@@ -149,9 +148,21 @@ func parseLeadingInt(s string) (int, error) {
 // structured-filter files-from list as preflight so excludes and max-size are
 // enforced on the source side and excluded remote objects are removed (§17).
 func (s *Service) FullSync(ctx context.Context, p *state.Profile, options SyncOptions) error {
+	_, err := s.fullSync(ctx, p, options, nil)
+	return err
+}
+
+// FullSyncProgress is like FullSync but streams best-effort transfer progress
+// (§10.1). onStats may be nil.
+func (s *Service) FullSyncProgress(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats)) error {
+	_, err := s.fullSync(ctx, p, options, onStats)
+	return err
+}
+
+func (s *Service) fullSync(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats)) (*PreflightResult, error) {
 	list, _, err := s.sourceFilesFrom(p)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.Remove(list)
 
@@ -165,11 +176,11 @@ func (s *Service) FullSync(ctx context.Context, p *state.Profile, options SyncOp
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
-	res := s.Rclone.Run(ctx, args...)
+	res := s.Rclone.RunProgress(ctx, onStats, args...)
 	if res.Err != nil {
-		return fmt.Errorf("full sync: %w: %s", res.Err, res.StderrTrimmed())
+		return nil, fmt.Errorf("full sync: %w: %s", res.Err, res.StderrTrimmed())
 	}
-	return nil
+	return &PreflightResult{}, nil
 }
 
 func effectiveDeleteLimit(p *state.Profile, o SyncOptions) int {

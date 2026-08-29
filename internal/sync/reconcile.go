@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"knowledge-sync/internal/exec"
 	"knowledge-sync/internal/state"
 )
 
@@ -24,6 +25,13 @@ func NewReconciler(s *Service) *Reconciler { return &Reconciler{Service: s} }
 //  5. run live destructive sync with rclone's --max-delete guard;
 //  6. mark profile dirty if local changes occurred during live sync.
 func (r *Reconciler) Reconcile(ctx context.Context, p *state.Profile, options SyncOptions) (*PreflightResult, error) {
+	pre, err := r.ReconcileProgress(ctx, p, options, nil)
+	return pre, err
+}
+
+// ReconcileProgress is Reconcile with best-effort transfer progress callbacks
+// (§10.1). onStats may be nil.
+func (r *Reconciler) ReconcileProgress(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats)) (*PreflightResult, error) {
 	pre, err := r.Preflight(ctx, p, options)
 	if err != nil {
 		return nil, err
@@ -37,7 +45,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, p *state.Profile, options Sy
 	if pre.ToDelete > effectiveDeleteLimit(p, options) {
 		return pre, ErrDeleteBudgetExceeded
 	}
-	if err := r.Service.FullSync(ctx, p, options); err != nil {
+	if _, err := r.Service.fullSync(ctx, p, options, onStats); err != nil {
 		return pre, err
 	}
 	if err := r.markDirtyIfChanged(ctx, p, pre); err != nil {
@@ -71,8 +79,10 @@ func (r *Reconciler) Preflight(ctx context.Context, p *state.Profile, options Sy
 	return dry, nil
 }
 
-// markDirtyIfChanged re-scans after the live sync and requests a follow-up
-// reconciliation if the source changed during sync (§15.1.7).
+// markDirtyIfChanged re-scans after the live sync and advances desired
+// reconciliation intent if the source changed during sync (§15.1.7). Advancing
+// the durable generation leaves the follow-up reconciliation eligible; it never
+// expands the already-completed run's target (§20).
 func (r *Reconciler) markDirtyIfChanged(ctx context.Context, p *state.Profile, pre *PreflightResult) error {
 	scan, err := ScanLocal(p)
 	if err != nil {
