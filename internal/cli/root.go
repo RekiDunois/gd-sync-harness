@@ -26,6 +26,7 @@ type App struct {
 	Remote     *remote.Manager
 	Sync       *sync.Service
 	Reconciler *sync.Reconciler
+	scheduler  *syncScheduler
 
 	ConfigPath string
 	RcloneBin  string
@@ -73,7 +74,7 @@ func NewApp() (*App, error) {
 	return &App{
 		DB: db, Rclone: rclone, Remote: rm, Sync: svc, Reconciler: rec,
 		ConfigPath: configPath, RcloneBin: rcloneBin, FSWatchBin: fswatchBin,
-		LogDir: logDir,
+		LogDir: logDir, scheduler: newSyncScheduler(),
 	}, nil
 }
 
@@ -134,6 +135,8 @@ func NewRootCmd() *cobra.Command {
 		newWatchCmd(),
 		newVerifyCmd(),
 		newRepairDuplicatesCmd(),
+		newPurgeRemoteCmd(),
+		newProbeCmd(),
 		newStopCmd(),
 	)
 

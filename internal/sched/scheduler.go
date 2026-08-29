@@ -20,11 +20,11 @@ type Scheduler struct {
 }
 
 type remoteQueue struct {
-	cond    *sync.Cond
-	mu      sync.Mutex
-	jobs    []Job
-	running int
-	closed  bool
+	mu   sync.Mutex
+	cond *sync.Cond
+	jobs []Job
+	// slots is a counting semaphore for concurrent executions on this remote.
+	slots chan struct{}
 }
 
 // New builds a scheduler. MaxConcurrent is per-remote.
@@ -36,12 +36,12 @@ func New(maxConcurrent int) *Scheduler {
 }
 
 // Submit queues a job for a remote and returns a channel that completes when
-// the job is done.
+// the job is done. Priority sorts within the remote queue (higher first).
 func (s *Scheduler) Submit(ctx context.Context, job Job) (done chan error) {
 	s.mu.Lock()
 	q, ok := s.queues[job.Remote]
 	if !ok {
-		q = &remoteQueue{}
+		q = &remoteQueue{slots: make(chan struct{}, s.MaxConcurrent)}
 		q.cond = sync.NewCond(&q.mu)
 		s.queues[job.Remote] = q
 	}
@@ -72,33 +72,31 @@ func (s *Scheduler) Submit(ctx context.Context, job Job) (done chan error) {
 	return done
 }
 
-// run pops and executes jobs from the queue while holding capacity.
+// run pops and executes a single job, acquiring a per-remote slot. The caller
+// (per Submit) runs exactly one job; the queue coordinates the rest.
 func (s *Scheduler) run(ctx context.Context, q *remoteQueue) error {
 	q.mu.Lock()
-	for q.closed || len(q.jobs) == 0 {
-		if q.closed {
-			q.mu.Unlock()
-			return nil
-		}
+	for len(q.jobs) == 0 {
 		q.cond.Wait()
-		if q.closed {
+		if ctx.Err() != nil {
 			q.mu.Unlock()
-			return nil
+			return ctx.Err()
 		}
 	}
 	job := q.jobs[0]
 	q.jobs = q.jobs[1:]
 	q.mu.Unlock()
 
-	q.mu.Lock()
-	q.running++
-	q.mu.Unlock()
-	defer func() {
+	select {
+	case q.slots <- struct{}{}:
+	case <-ctx.Done():
+		// Requeue at front and return.
 		q.mu.Lock()
-		q.running--
-		q.cond.Broadcast()
+		q.jobs = append([]Job{job}, q.jobs...)
+		q.cond.Signal()
 		q.mu.Unlock()
-	}()
-
+		return ctx.Err()
+	}
+	defer func() { <-q.slots }()
 	return job.Run(ctx)
 }

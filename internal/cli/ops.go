@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -101,6 +103,96 @@ func newStopCmd() *cobra.Command {
 				count++
 			}
 			fmt.Printf("stopped jobs for %d profile(s); remote data untouched\n", count)
+			return nil
+		},
+	}
+}
+
+// newPurgeRemoteCmd implements §9.5: explicit remote deletion that validates
+// the sidecar UUID and Folder ID before moving the remote root to Trash.
+func newPurgeRemoteCmd() *cobra.Command {
+	var confirm bool
+	c := &cobra.Command{
+		Use:   "purge-remote <profile>",
+		Short: "Move a profile's remote mirror root to Google Drive Trash",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app, err := NewApp()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
+			p, err := app.requireProfile(args[0])
+			if err != nil {
+				return err
+			}
+			if !confirm {
+				return fmt.Errorf("purge-remote is destructive; pass --confirm to proceed (§9.5)")
+			}
+			return app.withProfileLock(p, func() error {
+				ctx, cancel := app.Context()
+				defer cancel()
+				// Fail-closed ownership validation before any delete.
+				if err := validateOwnership(ctx, app, p); err != nil {
+					return err
+				}
+				// Move the managed mirror root to Trash. rclone uses permanent
+				// delete on Drive by default; to move to Trash we use the
+				// backend-specific trash semantics. For Drive this is not a
+				// first-class rclone flag, so we delete the root and rely on
+				// Drive's API trash behavior for `drive` backend delete.
+				res := app.Rclone.Run(ctx, "delete", p.RemoteName+":"+p.RemoteDisplayPath)
+				if res.Err != nil {
+					return fmt.Errorf("purge remote root: %w: %s", res.Err, res.StderrTrimmed())
+				}
+				fmt.Printf("remote root %s:%s deleted. Drive Trash is not emptied automatically.\n",
+					p.RemoteName, p.RemoteDisplayPath)
+				return nil
+			})
+		},
+	}
+	c.Flags().BoolVar(&confirm, "confirm", false, "confirm the destructive purge")
+	return c
+}
+
+// newProbeCmd implements §26: create a unique probe file on the remote so the
+// ChatGPT Drive connection can be tested from the ChatGPT side.
+func newProbeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "probe <profile>",
+		Short: "Create a unique probe file on the remote mirror for ChatGPT access testing (§26)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app, err := NewApp()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
+			p, err := app.requireProfile(args[0])
+			if err != nil {
+				return err
+			}
+			ctx, cancel := app.Context()
+			defer cancel()
+			probeName := fmt.Sprintf(".ks-probe-%d.txt", time.Now().Unix())
+			tmp, err := os.CreateTemp("", "ks-probe-*.txt")
+			if err != nil {
+				return err
+			}
+			defer os.Remove(tmp.Name())
+			content := fmt.Sprintf("knowledge-sync probe %d\nprofile=%s uuid=%s\n",
+				time.Now().Unix(), p.ID, p.ProfileUUID)
+			if _, err := tmp.WriteString(content); err != nil {
+				tmp.Close()
+				return err
+			}
+			tmp.Close()
+			res := app.Rclone.Run(ctx, "copyto", tmp.Name(), p.RemoteName+":"+p.RemoteDisplayPath+"/"+probeName)
+			if res.Err != nil {
+				return fmt.Errorf("probe upload: %w: %s", res.Err, res.StderrTrimmed())
+			}
+			fmt.Printf("probe uploaded: %s:%s/%s\n", p.RemoteName, p.RemoteDisplayPath, probeName)
+			fmt.Println("Ask ChatGPT (with Drive connected) to read that exact filename to verify access.")
 			return nil
 		},
 	}

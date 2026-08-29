@@ -86,10 +86,6 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 		return nil, err
 	}
 
-	if _, err := s.Remote.ValidateRemote(ctx, o.RemoteName); err != nil {
-		return nil, err
-	}
-
 	uuid := newUUID()
 
 	if o.DryRun {
@@ -99,6 +95,11 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 			Enabled: true, MaxDelete: o.MaxDelete, MaxFileSize: o.MaxFileSize,
 		}
 		return p, nil
+	}
+
+	// 5. validate rclone remote is a Google Drive backend (network/read-only).
+	if _, err := s.Remote.ValidateRemote(ctx, o.RemoteName); err != nil {
+		return nil, err
 	}
 
 	folderID, err := s.Remote.CreateManagedRoot(ctx, o.RemoteName, o.RemotePath)

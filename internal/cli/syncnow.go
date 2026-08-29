@@ -80,7 +80,7 @@ func runSyncNow(app *App, p *state.Profile) error {
 		return nil
 	}
 
-	if err := app.Sync.FastUpsert(ctx, p, files); err != nil {
+	if err := app.upsertForProfile(ctx, p, files); err != nil {
 		_ = app.DB.SetLastError(p.ID, err.Error())
 		return err
 	}

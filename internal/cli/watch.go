@@ -69,7 +69,7 @@ func runWatcher(app *App, p *state.Profile) error {
 			if len(eligible) == 0 {
 				return nil
 			}
-			if err := app.Sync.FastUpsert(ctx, p, eligible); err != nil {
+			if err := app.upsertForProfile(ctx, p, eligible); err != nil {
 				lg.Printf("fast upsert failed: %v", err)
 				return err
 			}

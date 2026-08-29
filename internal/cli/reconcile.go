@@ -65,7 +65,7 @@ func runReconcile(app *App, p *state.Profile, options sync.SyncOptions, schedule
 		return err
 	}
 
-	pre, err := app.Reconciler.Reconcile(ctx, p, options)
+	pre, err := app.reconcileForProfile(ctx, p, options)
 	if err != nil {
 		_ = app.DB.SetLastError(p.ID, err.Error())
 		if err == sync.ErrDeleteBudgetExceeded {
