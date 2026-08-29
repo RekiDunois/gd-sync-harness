@@ -431,11 +431,11 @@ func runMigrate(app *App, p *state.Profile, newRemote, newPath string) error {
 	}
 	backupNow(app)
 
-	pre, err := app.Reconciler.Reconcile(ctx, &newP, sync.SyncOptions{})
-	if err != nil {
+	// 10. one successful sync/reconcile against new destination (§22.10).
+	// Reuse runReconcile so ownership validation runs against the new binding.
+	if err := runReconcile(app, &newP, sync.SyncOptions{}, false); err != nil {
 		return fmt.Errorf("post-migration reconcile: %w", err)
 	}
-	_ = pre
 
 	fmt.Printf("migration complete. Old remote root %s:%s was left in place;\n", p.RemoteName, p.RemoteDisplayPath)
 	fmt.Printf("move it to Trash manually (harness does not auto-empty Trash).\n")
