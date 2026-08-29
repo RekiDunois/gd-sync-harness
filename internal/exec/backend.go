@@ -31,21 +31,27 @@ type Feature struct {
 	} `json:"Features"`
 }
 
-// RemoteBackend returns the backend type for a remote.
+// RemoteBackend returns the backend type for a remote. rclone's `backend
+// features` JSON has `Name` = remote name (not the backend type), so we parse
+// `rclone config show <remote>` which contains a `type = <backend>` line.
 func RemoteBackend(ctx context.Context, r *Rclone, remote string) (string, error) {
 	name := strings.TrimSuffix(remote, ":")
-	res := r.Run(ctx, "backend", "features", name+":")
+	res := r.Run(ctx, "config", "show", name)
 	if res.Err != nil {
-		return "", fmt.Errorf("rclone backend features %s: %w: %s", name, res.Err, res.StderrTrimmed())
+		return "", fmt.Errorf("rclone config show %s: %w: %s", name, res.Err, res.StderrTrimmed())
 	}
-	var f Feature
-	if err := json.Unmarshal(res.Stdout, &f); err != nil {
-		return "", fmt.Errorf("parse backend features for %s: %w", name, err)
+	// Parse the `type = <backend>` line from the config section.
+	for _, line := range strings.Split(res.StdoutTrimmed(), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "type = ") {
+			backend := strings.TrimSpace(strings.TrimPrefix(line, "type = "))
+			if backend == "" {
+				continue
+			}
+			return strings.ToLower(backend), nil
+		}
 	}
-	if f.Name == "" {
-		return "", fmt.Errorf("backend features for %s returned empty name", name)
-	}
-	return strings.ToLower(f.Name), nil
+	return "", fmt.Errorf("could not determine backend type for remote %q", name)
 }
 
 // ListRemotes returns remote names via `rclone listremotes`.

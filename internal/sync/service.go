@@ -180,9 +180,18 @@ func effectiveDeleteLimit(p *state.Profile, o SyncOptions) int {
 }
 
 // VerifyCheck runs `rclone check --one-way --size-only` (migration verification).
+// It applies the structured filter (§10.1) so excluded source files are not
+// reported as missing on the remote.
 func (s *Service) VerifyCheck(ctx context.Context, p *state.Profile) error {
+	list, _, err := s.sourceFilesFrom(p)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(list)
+
 	args := []string{
 		"check", "--one-way", "--size-only",
+		"--files-from", list,
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
@@ -194,9 +203,17 @@ func (s *Service) VerifyCheck(ctx context.Context, p *state.Profile) error {
 }
 
 // VerifyFull runs a full hash-level check (`rclone check --one-way`), §27.
+// It applies the structured filter (§10.1).
 func (s *Service) VerifyFull(ctx context.Context, p *state.Profile) error {
+	list, _, err := s.sourceFilesFrom(p)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(list)
+
 	args := []string{
 		"check", "--one-way",
+		"--files-from", list,
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}

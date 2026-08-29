@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"knowledge-sync/internal/exec"
 	"knowledge-sync/internal/state"
@@ -53,9 +54,9 @@ func (m *Manager) ValidateRemote(ctx context.Context, remote string) (string, er
 // CreateManagedRoot creates the remote mirror path under remote root using
 // `rclone mkdir` (idempotent) and then resolves the stable Folder ID.
 func (m *Manager) CreateManagedRoot(ctx context.Context, remote, remotePath string) (folderID string, err error) {
-	res := m.Rclone.Run(ctx, "mkdir", remote+remotePath)
+	res := m.Rclone.Run(ctx, "mkdir", remote+":"+remotePath)
 	if res.Err != nil {
-		return "", fmt.Errorf("rclone mkdir %s: %w: %s", remote+remotePath, res.Err, res.StderrTrimmed())
+		return "", fmt.Errorf("rclone mkdir %s: %w: %s", remote+":"+remotePath, res.Err, res.StderrTrimmed())
 	}
 	id, err := m.ResolveFolderID(ctx, remote, remotePath)
 	if err != nil {
@@ -64,42 +65,68 @@ func (m *Manager) CreateManagedRoot(ctx context.Context, remote, remotePath stri
 	return id, nil
 }
 
-// ResolveFolderID returns the Google Drive Folder ID for a remote path using
-// `rclone backend get` first, then `rclone lsd --json`.
+// ResolveFolderID returns the stable Google Drive Folder ID for a remote path.
+// It walks the path components from the remote root, using `rclone lsjson`
+// (which returns each object's `ID`) at each level to descend into the target
+// folder. This avoids trusting path strings alone and works with drive.file
+// scope where the folder was created by this OAuth app.
 func (m *Manager) ResolveFolderID(ctx context.Context, remote, remotePath string) (string, error) {
 	name := strings.TrimSuffix(remote, ":")
-	res := m.Rclone.Run(ctx, "backend", "get", name+":"+remotePath)
-	if res.Err == nil && len(res.Stdout) > 0 {
-		var meta map[string]any
-		if err := json.Unmarshal(res.Stdout, &meta); err == nil {
-			if id, ok := meta["id"].(string); ok && id != "" {
-				return id, nil
+	parts := strings.Split(strings.Trim(remotePath, "/"), "/")
+	if len(parts) == 1 && parts[0] == "" {
+		return "", fmt.Errorf("cannot resolve folder id for remote root")
+	}
+
+	// Walk from the root: at each level list direct children and find the next
+	// component by name (case-sensitive on Drive display names). Google Drive
+	// is eventually consistent after mkdir, so retry briefly with backoff.
+	current := ""
+	for i, part := range parts {
+		var found string
+		for attempt := 0; attempt < 5; attempt++ {
+			lsPath := current
+			ls := m.Rclone.Run(ctx, "lsjson", name+":"+lsPath)
+			if ls.Err != nil {
+				return "", fmt.Errorf("lsjson %s: %w: %s", name+":"+lsPath, ls.Err, ls.StderrTrimmed())
+			}
+			var entries []struct {
+				Path  string `json:"Path"`
+				Name  string `json:"Name"`
+				ID    string `json:"ID"`
+				IsDir bool   `json:"IsDir"`
+			}
+			if err := json.Unmarshal(ls.Stdout, &entries); err != nil {
+				return "", fmt.Errorf("parse lsjson: %w", err)
+			}
+			for _, e := range entries {
+				if e.IsDir && e.Name == part {
+					found = e.ID
+					break
+				}
+			}
+			if found != "" {
+				break
+			}
+			if attempt < 4 {
+				time.Sleep(consistencyRetryDelay(attempt))
 			}
 		}
-	}
-	parent := ""
-	leaf := remotePath
-	if idx := strings.LastIndex(remotePath, "/"); idx >= 0 {
-		parent = remotePath[:idx]
-		leaf = remotePath[idx+1:]
-	}
-	ls := m.Rclone.Run(ctx, "lsd", "--json", name+":"+parent)
-	if ls.Err != nil {
-		return "", fmt.Errorf("lsd %s: %w: %s", name+":"+parent, ls.Err, ls.StderrTrimmed())
-	}
-	var entries []struct {
-		Path string `json:"Path"`
-		ID   string `json:"ID"`
-	}
-	if err := json.Unmarshal(ls.Stdout, &entries); err != nil {
-		return "", fmt.Errorf("parse lsd: %w", err)
-	}
-	for _, e := range entries {
-		if e.Path == leaf {
-			return e.ID, nil
+		if found == "" {
+			return "", fmt.Errorf("folder %q not found under %q on %q (after retries)", part, current, remote)
+		}
+		current = current + "/" + part
+		if i == len(parts)-1 {
+			return found, nil
 		}
 	}
-	return "", fmt.Errorf("folder %q not found under %q on %q", leaf, parent, remote)
+	return "", fmt.Errorf("could not resolve folder id for %q", remotePath)
+}
+
+// consistencyRetryDelay returns the backoff delay for the given attempt index,
+// scaling up to handle Google Drive eventual consistency after mkdir.
+func consistencyRetryDelay(attempt int) time.Duration {
+	// 200ms, 400ms, 800ms, 1600ms
+	return time.Duration(200*(1<<uint(attempt))) * time.Millisecond
 }
 
 // CheckQuota queries and stores quota state for a remote (§24).

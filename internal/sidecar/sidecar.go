@@ -45,9 +45,9 @@ func Read(ctx context.Context, r *exec.Rclone, remote, remotePath string) (*Side
 	defer os.Remove(tmp.Name())
 	tmp.Close()
 
-	res := r.Run(ctx, "copyto", remote+remotePath, tmp.Name())
+	res := r.Run(ctx, "copyto", remote+":"+remotePath, tmp.Name())
 	if res.Err != nil {
-		return nil, fmt.Errorf("sidecar fetch %s: %w: %s", remotePath, res.Err, res.StderrTrimmed())
+		return nil, fmt.Errorf("sidecar fetch %s: %w: %s", remote+":"+remotePath, res.Err, res.StderrTrimmed())
 	}
 	b, err := os.ReadFile(tmp.Name())
 	if err != nil {
@@ -81,7 +81,7 @@ func Write(ctx context.Context, r *exec.Rclone, remote string, s *Sidecar) error
 	}
 	tmp.Close()
 
-	res := r.Run(ctx, "copyto", tmp.Name(), remote+RemoteProfilesDir()+"/"+s.ProfileUUID+".json")
+	res := r.Run(ctx, "copyto", tmp.Name(), remote+":"+RemoteProfilesDir()+"/"+s.ProfileUUID+".json")
 	if res.Err != nil {
 		return fmt.Errorf("sidecar write: %w: %s", res.Err, res.StderrTrimmed())
 	}
@@ -90,7 +90,7 @@ func Write(ctx context.Context, r *exec.Rclone, remote string, s *Sidecar) error
 
 // Exists reports whether a sidecar exists at the expected remote path.
 func Exists(ctx context.Context, r *exec.Rclone, remote, profileUUID string) (bool, error) {
-	res := r.Run(ctx, "lsf", remote+RemoteProfilesDir(), "--files-only")
+	res := r.Run(ctx, "lsf", remote+":"+RemoteProfilesDir(), "--files-only")
 	if res.Err != nil {
 		return false, fmt.Errorf("sidecar ls: %w: %s", res.Err, res.StderrTrimmed())
 	}

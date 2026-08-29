@@ -139,6 +139,14 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 		}
 	}
 
+	// Reload excludes so initialCopy applies the structured filter (§10.1):
+	// AddExclude wrote to SQLite but p.Excludes is not updated in place.
+	excludes, err := s.DB.GetExcludes(o.ID)
+	if err != nil {
+		return nil, err
+	}
+	p.Excludes = excludes
+
 	if err := s.initialCopy(ctx, p); err != nil {
 		return nil, fmt.Errorf("initial copy: %w", err)
 	}

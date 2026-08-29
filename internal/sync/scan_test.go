@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"knowledge-sync/internal/filter"
 	"knowledge-sync/internal/state"
 )
 
@@ -98,6 +99,45 @@ func TestParseCount(t *testing.T) {
 	}
 	if parseCount("Nothing") != 0 {
 		t.Error("no digits should be 0")
+	}
+}
+
+// TestTypedExcludesRoundTrip validates that GetExcludes returns
+// "rule_type:rule_value" strings and that filter.FromProfile correctly applies
+// an obsidian dir_name exclusion to the scan (regression for the initialCopy
+// bug where .obsidian was uploaded because p.Excludes was stale).
+func TestTypedExcludesRoundTrip(t *testing.T) {
+	db, err := state.Open(filepath.Join(t.TempDir(), "x.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	p := &state.Profile{
+		ID: "obs", ProfileUUID: "u1", Type: "obsidian",
+		SourcePath: "/vault", RemoteName: "g", RemoteFolderID: "f",
+		RemoteDisplayPath: "x", Enabled: true,
+	}
+	if err := db.CreateProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddExclude(p.ID, state.RuleExcludeDirName, ".obsidian"); err != nil {
+		t.Fatal(err)
+	}
+	ex, err := db.GetExcludes(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ex) != 1 || ex[0] != "exclude_dir_name:.obsidian" {
+		t.Fatalf("GetExcludes = %v, want [exclude_dir_name:.obsidian]", ex)
+	}
+	p.Excludes = ex
+	eng := filter.FromProfile(p)
+	if excluded, _ := eng.Excluded(".obsidian/app.json"); !excluded {
+		t.Error(".obsidian/app.json should be excluded via dir_name rule")
+	}
+	if excluded, _ := eng.Excluded("notes/welcome.md"); excluded {
+		t.Error("notes/welcome.md should not be excluded")
 	}
 }
 
