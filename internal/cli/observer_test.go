@@ -112,7 +112,7 @@ func TestObserverLiveRendersFilesPerMin(t *testing.T) {
 	phase := state.PhaseUploading
 	runID := "run-fpm"
 	snap := &live.StatusSnapshot{
-		ProfileID: "obsidian-main",
+		ProfileID: "example-profile",
 		Profile:   live.ProfileS{Enabled: true},
 		Sync:      live.SyncS{State: state.StateSyncing, Phase: &phase},
 		Activity: &live.ActivityS{
@@ -149,7 +149,7 @@ func TestObserverLiveHidesFilesPerMinOutsideTransfer(t *testing.T) {
 	phase := state.PhaseFinalizing
 	runID := "run-fpm2"
 	snap := &live.StatusSnapshot{
-		ProfileID: "obsidian-main",
+		ProfileID: "example-profile",
 		Profile:   live.ProfileS{Enabled: true},
 		Sync:      live.SyncS{State: state.StateSyncing, Phase: &phase},
 		Activity: &live.ActivityS{
