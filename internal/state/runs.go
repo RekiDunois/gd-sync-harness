@@ -13,9 +13,8 @@ const (
 
 // Run kinds.
 const (
-	RunKindInitial     = "initial"
-	RunKindFull        = "full"
-	RunKindIncremental = "incremental"
+	RunKindInitial = "initial"
+	RunKindFull    = "full"
 )
 
 // Run phase values (internal granularity, §11).
@@ -59,6 +58,11 @@ type SyncRun struct {
 	ErrorCode           string  `json:"error_code"`
 	ErrorClassification string  `json:"error_classification"`
 	Error               string  `json:"error"`
+	// EffectiveMaxDelete is the destructive budget applied to this attempt.
+	EffectiveMaxDelete int `json:"effective_max_delete"`
+	// ManualDeleteOverride is non-nil when the budget came from a one-attempt
+	// manual override (§11.1, §11.4).
+	ManualDeleteOverride *int `json:"manual_delete_override,omitempty"`
 }
 
 const runCols = `id, profile_id, kind, target_generation, status, phase,
@@ -66,17 +70,20 @@ const runCols = `id, profile_id, kind, target_generation, status, phase,
 	bytes_total, bytes_completed, last_progress_at, error_code,
 	error_classification, error, last_heartbeat_at, checks_completed,
 	checks_total, items_listed, errors_count, speed_bytes_per_second,
-	current_item, current_item_bytes, current_item_size, active_transfers, upload_started_at`
+	current_item, current_item_bytes, current_item_size, active_transfers, upload_started_at,
+	effective_max_delete, manual_delete_override`
 
 func scanRun(row interface{ Scan(...any) error }) (*SyncRun, error) {
 	var r SyncRun
 	var comp, last, phase, heartbeat, current, uploadStarted sql.NullString
+	var manualOverride sql.NullInt64
 	if err := row.Scan(&r.ID, &r.ProfileID, &r.Kind, &r.TargetGeneration,
 		&r.Status, &phase, &r.StartedAt, &comp, &r.FilesDiscovered,
 		&r.FilesCompleted, &r.BytesTotal, &r.BytesCompleted, &last,
 		&r.ErrorCode, &r.ErrorClassification, &r.Error, &heartbeat,
 		&r.ChecksCompleted, &r.ChecksTotal, &r.ItemsListed, &r.ErrorsCount,
-		&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize, &r.ActiveTransfers, &uploadStarted); err != nil {
+		&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize, &r.ActiveTransfers, &uploadStarted,
+		&r.EffectiveMaxDelete, &manualOverride); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ErrNotFound
 		}
@@ -88,6 +95,10 @@ func scanRun(row interface{ Scan(...any) error }) (*SyncRun, error) {
 	r.LastHeartbeatAt = nullStr(heartbeat)
 	r.CurrentItem = nullStr(current)
 	r.UploadStartedAt = nullStr(uploadStarted)
+	if manualOverride.Valid {
+		v := int(manualOverride.Int64)
+		r.ManualDeleteOverride = &v
+	}
 	return &r, nil
 }
 
@@ -97,12 +108,14 @@ func scanRuns(rows *sql.Rows) ([]*SyncRun, error) {
 	for rows.Next() {
 		var r SyncRun
 		var comp, last, phase, heartbeat, current, uploadStarted sql.NullString
+		var manualOverride sql.NullInt64
 		if err := rows.Scan(&r.ID, &r.ProfileID, &r.Kind, &r.TargetGeneration,
 			&r.Status, &phase, &r.StartedAt, &comp, &r.FilesDiscovered,
 			&r.FilesCompleted, &r.BytesTotal, &r.BytesCompleted, &last,
 			&r.ErrorCode, &r.ErrorClassification, &r.Error, &heartbeat,
 			&r.ChecksCompleted, &r.ChecksTotal, &r.ItemsListed, &r.ErrorsCount,
-			&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize, &r.ActiveTransfers, &uploadStarted); err != nil {
+			&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize, &r.ActiveTransfers, &uploadStarted,
+			&r.EffectiveMaxDelete, &manualOverride); err != nil {
 			return nil, err
 		}
 		r.Phase = phase.String
@@ -111,24 +124,13 @@ func scanRuns(rows *sql.Rows) ([]*SyncRun, error) {
 		r.LastHeartbeatAt = nullStr(heartbeat)
 		r.CurrentItem = nullStr(current)
 		r.UploadStartedAt = nullStr(uploadStarted)
+		if manualOverride.Valid {
+			v := int(manualOverride.Int64)
+			r.ManualDeleteOverride = &v
+		}
 		out = append(out, &r)
 	}
 	return out, rows.Err()
-}
-
-// CreateRun inserts a running attempt for a profile. It must be invoked inside
-// the same transaction as the claim boundary so run ownership and the run row
-// commit atomically.
-func (d *DB) CreateRun(p *SyncRun) error {
-	_, err := d.Exec(`INSERT INTO sync_runs (
-		id, profile_id, kind, target_generation, status, phase, started_at,
-		files_discovered, files_completed, bytes_total, bytes_completed,
-		error_code, error_classification, error
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.ID, p.ProfileID, p.Kind, p.TargetGeneration, p.Status, p.Phase,
-		p.StartedAt, p.FilesDiscovered, p.FilesCompleted, p.BytesTotal,
-		p.BytesCompleted, p.ErrorCode, p.ErrorClassification, p.Error)
-	return err
 }
 
 // GetRun returns a single run.

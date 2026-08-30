@@ -238,30 +238,16 @@ const (
 )
 
 // ClaimRun atomically claims the next reconciliation attempt for a profile.
-// It verifies lifecycle, debt (unless force), retry gates, and the absence of an
-// active run inside a single write transaction, capturing target_generation =
-// desired_generation (§24.1, §25). It returns the claimed run and the result.
+// It verifies lifecycle, debt, retry gates, and the absence of an active run
+// inside a single write transaction, capturing target_generation =
+// desired_generation (§24.1, §25). It atomically consumes any pending manual
+// one-shot options into the new run's audit fields (§11.2). It returns the
+// claimed run and the result.
 func (d *DB) ClaimRun(profileID, runID string) (*SyncRun, ClaimResult, error) {
-	return d.claimRun(profileID, runID, false, false)
+	return d.claimRun(profileID, runID)
 }
 
-// ClaimRunMode is ClaimRun with a force flag. When force is true the debt
-// requirement is skipped so periodic safety-net reconciliations (hourly
-// scheduled, explicit manual) run a full reconciliation even with no known
-// debt, matching the pre-existing safety-net semantics. Lifecycle, gate, and
-// single-active-run constraints always apply.
-func (d *DB) ClaimRunMode(profileID, runID string, force bool) (*SyncRun, ClaimResult, error) {
-	return d.claimRun(profileID, runID, force, force)
-}
-
-// ClaimRunWithOptions separates the debt override from the automatic
-// destructive-debounce override. Manual reconcile-now uses both; scheduled
-// safety runs use only the former.
-func (d *DB) ClaimRunWithOptions(profileID, runID string, force, bypassDebounce bool) (*SyncRun, ClaimResult, error) {
-	return d.claimRun(profileID, runID, force, bypassDebounce)
-}
-
-func (d *DB) claimRun(profileID, runID string, force, bypassDebounce bool) (*SyncRun, ClaimResult, error) {
+func (d *DB) claimRun(profileID, runID string) (*SyncRun, ClaimResult, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return nil, ClaimProfileInactive, err
@@ -270,8 +256,9 @@ func (d *DB) claimRun(profileID, runID string, force, bypassDebounce bool) (*Syn
 
 	var tomb, enabled int
 	var del sql.NullString
-	if err := tx.QueryRow(`SELECT tombstoned, enabled, deletion_requested_at
-		FROM profiles WHERE id = ?`, profileID).Scan(&tomb, &enabled, &del); err != nil {
+	var maxDelete int
+	if err := tx.QueryRow(`SELECT tombstoned, enabled, deletion_requested_at, max_delete
+		FROM profiles WHERE id = ?`, profileID).Scan(&tomb, &enabled, &del, &maxDelete); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ClaimProfileInactive, nil
 		}
@@ -306,14 +293,12 @@ func (d *DB) claimRun(profileID, runID string, force, bypassDebounce bool) (*Syn
 		s.LastSuccessGeneration = &lsg.Int64
 	}
 	hasDebt := s.HasDebt()
-	if !force && !hasDebt {
+	if !hasDebt {
 		return nil, ClaimNoDebt, nil
 	}
 	nowT := Now()
 	now := nowT.Format(timeFmt)
-	if !bypassDebounce && notBefore.Valid && now < notBefore.String {
-		return nil, ClaimDeferred, nil
-	}
+	bypassDebounce := false
 	if state.String == StateError {
 		if rc.String == RetryTerminal {
 			return nil, ClaimGateBlocked, nil
@@ -328,19 +313,61 @@ func (d *DB) claimRun(profileID, runID string, force, bypassDebounce bool) (*Syn
 	if !lsg.Valid {
 		kind = RunKindInitial
 	}
+	// Compute the effective delete limit from any unconsumed one-attempt manual
+	// override, falling back to the profile's persistent budget (§11.2). The
+	// override is consumed in the same transaction that creates the run row.
+	effectiveDelete := 0
+	var manualOverride interface{}
+	pending, err := readPendingManualTx(tx, profileID)
+	if err != nil {
+		return nil, ClaimProfileInactive, err
+	}
+	if pending != nil && pending.Generation == target {
+		effectiveDelete = pending.AllowDeletes
+		if pending.AllowDeletes > 0 {
+			manualOverride = pending.AllowDeletes
+		}
+		bypassDebounce = bypassDebounce || pending.BypassDebounce
+	}
+	// The durable destructive debounce window applies unless a manual request
+	// bypassed it. Non-manual (filesystem/scheduled) intent always respects it.
+	if !bypassDebounce && notBefore.Valid && now < notBefore.String {
+		return nil, ClaimDeferred, nil
+	}
+	if effectiveDelete == 0 {
+		effectiveDelete = maxDelete
+	}
 	run := &SyncRun{
 		ID: runID, ProfileID: profileID, Kind: kind,
 		TargetGeneration: target, Status: RunRunning, Phase: PhaseQueued,
-		StartedAt: now,
+		StartedAt: now, EffectiveMaxDelete: effectiveDelete,
+	}
+	if manualOverride != nil {
+		if v, ok := manualOverride.(int); ok {
+			mv := v
+			run.ManualDeleteOverride = &mv
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO sync_runs (
 		id, profile_id, kind, target_generation, status, phase, started_at,
 		files_discovered, files_completed, bytes_total, bytes_completed,
-		error_code, error_classification, error
-	) VALUES (?,?,?,?,?,?,?,0,0,0,0,'','','')`,
+		error_code, error_classification, error,
+		effective_max_delete, manual_delete_override
+	) VALUES (?,?,?,?,?,?,?,0,0,0,0,'','','',?,?)`,
 		run.ID, run.ProfileID, run.Kind, run.TargetGeneration, run.Status,
-		run.Phase, run.StartedAt); err != nil {
+		run.Phase, run.StartedAt, effectiveDelete, manualOverride); err != nil {
 		return nil, ClaimProfileInactive, err
+	}
+	// Consume the one-shot manual override: a failed attempt does not
+	// automatically grant the same override to a retry (§11.3).
+	if pending != nil && pending.Generation == target {
+		if _, err := tx.Exec(`UPDATE profile_sync_state SET
+			pending_manual_generation = NULL,
+			pending_manual_allow_deletes = NULL,
+			pending_manual_bypass_debounce = 0
+			WHERE profile_id = ?`, profileID); err != nil {
+			return nil, ClaimProfileInactive, err
+		}
 	}
 	newState := StateInitializing
 	if lsg.Valid {

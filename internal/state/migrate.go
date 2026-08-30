@@ -225,6 +225,17 @@ func migrate(db *sql.DB) error {
 		ALTER TABLE sync_runs ADD COLUMN active_transfers INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE sync_runs ADD COLUMN upload_started_at TEXT;
 		`,
+		// v8: worker live status telemetry and durable one-attempt manual intent
+		// (§10, §11, §16). Pending manual execution metadata attaches to the
+		// existing desired_generation intent (no second request queue);
+		// sync_runs gains the effective destructive budget audit fields.
+		`
+		ALTER TABLE profile_sync_state ADD COLUMN pending_manual_generation INTEGER;
+		ALTER TABLE profile_sync_state ADD COLUMN pending_manual_allow_deletes INTEGER;
+		ALTER TABLE profile_sync_state ADD COLUMN pending_manual_bypass_debounce INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN effective_max_delete INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN manual_delete_override INTEGER;
+		`,
 	}
 
 	for i, m := range migrations {
