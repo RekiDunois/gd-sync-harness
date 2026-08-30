@@ -9,6 +9,7 @@ import (
 	"knowledge-sync/internal/exec"
 	"knowledge-sync/internal/state"
 )
+
 // Service performs fast-path upserts and full reconciliation through rclone.
 type Service struct {
 	Rclone *exec.Rclone
@@ -35,7 +36,7 @@ func (s *Service) FastUpsert(ctx context.Context, p *state.Profile, files []stri
 		"--files-from", list,
 		"--no-traverse",
 		"--fast-list",
-		"--transfers", "4",
+		"--transfers", "12",
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
@@ -83,6 +84,7 @@ func (s *Service) DryRunSync(ctx context.Context, p *state.Profile, options Sync
 		"--files-from", list,
 		"--delete-excluded",
 		"--fast-list",
+		"--transfers", "12",
 		"--track-renames",
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
@@ -171,6 +173,7 @@ func (s *Service) fullSync(ctx context.Context, p *state.Profile, options SyncOp
 		"--files-from", list,
 		"--delete-excluded",
 		"--fast-list",
+		"--transfers", "12",
 		"--track-renames",
 		fmt.Sprintf("--max-delete=%d", effectiveDeleteLimit(p, options)),
 		p.SourcePath,
