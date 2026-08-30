@@ -56,6 +56,7 @@ type ProgressStats struct {
 	Transfers, TotalTransfers                   int64
 	Listed, Deletes, Errors                     int64
 	Speed                                       float64
+	ActiveTransfers                             int64
 	CurrentItem                                 string
 	CurrentItemBytes, CurrentItemSize           int64
 	BytesKnown, TotalBytesKnown                 bool
@@ -63,6 +64,7 @@ type ProgressStats struct {
 	TransfersKnown, TotalTransfersKnown         bool
 	ListedKnown, DeletesKnown, ErrorsKnown      bool
 	SpeedKnown, CurrentItemKnown                bool
+	ActiveTransfersKnown                        bool
 	CurrentItemBytesKnown, CurrentItemSizeKnown bool
 }
 
@@ -162,7 +164,12 @@ func parseJSONProgressLine(line []byte) (ProgressStats, bool) {
 	}
 	if exists {
 		var transfers []map[string]json.RawMessage
-		if json.Unmarshal(rawTransfers, &transfers) == nil && len(transfers) > 0 {
+		if json.Unmarshal(rawTransfers, &transfers) == nil {
+			s.ActiveTransfers = int64(len(transfers))
+			s.ActiveTransfersKnown = true
+			if len(transfers) == 0 {
+				return s, true
+			}
 			item := transfers[0]
 			if rawName, exists := item["name"]; exists {
 				_ = json.Unmarshal(rawName, &s.CurrentItem)

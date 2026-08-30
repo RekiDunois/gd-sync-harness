@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"knowledge-sync/internal/config"
 	"knowledge-sync/internal/profile"
 	"knowledge-sync/internal/state"
 	"knowledge-sync/internal/sync"
@@ -450,9 +451,10 @@ func runMigrate(app *App, p *state.Profile, newRemote, newPath string) error {
 	}
 
 	copyArgs := []string{
-		"copy", p.SourcePath, newRemote + ":" + newPath,
-		"--fast-list", "--transfers", "4",
+		"copy", "--fast-list",
 	}
+	copyArgs = append(copyArgs, config.ArgsFor(config.Config{Rclone: app.Sync.RcloneConfig}, config.FastUpsert)...)
+	copyArgs = append(copyArgs, p.SourcePath, newRemote+":"+newPath)
 	res := app.Rclone.Run(ctx, copyArgs...)
 	if res.Err != nil {
 		return fmt.Errorf("migration copy: %w: %s", res.Err, res.StderrTrimmed())

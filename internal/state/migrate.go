@@ -220,6 +220,11 @@ func migrate(db *sql.DB) error {
 		);
 		CREATE INDEX idx_remote_leases ON remote_operation_leases(remote_name, state, priority, created_at);
 		`,
+		// v7: transfer concurrency and upload throughput anchor.
+		`
+		ALTER TABLE sync_runs ADD COLUMN active_transfers INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN upload_started_at TEXT;
+		`,
 	}
 
 	for i, m := range migrations {

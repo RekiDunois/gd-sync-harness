@@ -106,6 +106,17 @@ func renderProfileSyncStatus(app *App, id string) error {
 		if run.FilesCompleted > 0 {
 			fmt.Printf("Transferred files: %d\n", run.FilesCompleted)
 		}
+		if run.Phase == state.PhaseUploading {
+			if run.UploadStartedAt != nil {
+				if t, err := parseTime(*run.UploadStartedAt); err == nil {
+					minutes := time.Since(t).Minutes()
+					if minutes > 0 {
+						fmt.Printf("Files/min:          %.1f\n", float64(run.FilesCompleted)/minutes)
+					}
+				}
+			}
+			fmt.Printf("Active transfers:   %d\n", run.ActiveTransfers)
+		}
 		fmt.Printf("Listed: %d\n", run.ItemsListed)
 		fmt.Printf("Checked: %d", run.ChecksCompleted)
 		if run.ChecksTotal > 0 {

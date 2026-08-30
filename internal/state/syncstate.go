@@ -522,9 +522,10 @@ func (d *DB) OrphanCurrentRun(profileID string) error {
 
 // UpdateRunPhase records the current phase on the active run.
 func (d *DB) UpdateRunPhase(profileID, runID, phase string) error {
-	if _, err := d.Exec(`UPDATE sync_runs SET phase = ?
+	now := Now().Format(timeFmt)
+	if _, err := d.Exec(`UPDATE sync_runs SET phase = ?, upload_started_at = CASE WHEN ? = ? THEN COALESCE(upload_started_at, ?) ELSE upload_started_at END
 		WHERE id = ? AND profile_id = ? AND status = ?`,
-		phase, runID, profileID, RunRunning); err != nil {
+		phase, phase, PhaseUploading, now, runID, profileID, RunRunning); err != nil {
 		return err
 	}
 	_, err := d.Exec(`UPDATE profile_sync_state SET phase = ? WHERE profile_id = ?`, phase, profileID)
@@ -562,6 +563,7 @@ type ProgressSnapshot struct {
 	SpeedBytesPerSecond                                    float64
 	CurrentItem                                            *string
 	CurrentItemBytes, CurrentItemSize                      int64
+	ActiveTransfers                                        int64
 }
 
 // UpdateRunStats persists structured telemetry. last_progress_at changes only
@@ -574,12 +576,12 @@ func (d *DB) UpdateRunStats(profileID, runID string, s ProgressSnapshot, measura
 	}
 	if _, err := d.Exec(`UPDATE sync_runs SET files_completed = ?, bytes_completed = ?, bytes_total = ?,
 		last_heartbeat_at = ?, checks_completed = ?, checks_total = ?, items_listed = ?, errors_count = ?,
-		speed_bytes_per_second = ?, current_item = ?, current_item_bytes = ?, current_item_size = ?,
+		speed_bytes_per_second = ?, current_item = ?, current_item_bytes = ?, current_item_size = ?, active_transfers = ?,
 		last_progress_at = COALESCE(?, last_progress_at)
 		WHERE id = ? AND profile_id = ? AND status = ?`,
 		s.FilesCompleted, s.BytesCompleted, s.BytesTotal, now, s.ChecksCompleted, s.ChecksTotal,
 		s.ItemsListed, s.ErrorsCount, s.SpeedBytesPerSecond, s.CurrentItem, s.CurrentItemBytes,
-		s.CurrentItemSize, progress, runID, profileID, RunRunning); err != nil {
+		s.CurrentItemSize, s.ActiveTransfers, progress, runID, profileID, RunRunning); err != nil {
 		return err
 	}
 	if measurable {

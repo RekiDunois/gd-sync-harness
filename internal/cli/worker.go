@@ -344,6 +344,7 @@ func progressSnapshot(s rcexec.ProgressStats) state.ProgressSnapshot {
 		ChecksCompleted: s.Checks, ChecksTotal: s.TotalChecks, ItemsListed: s.Listed,
 		ErrorsCount: s.Errors, SpeedBytesPerSecond: s.Speed, CurrentItem: item,
 		CurrentItemBytes: s.CurrentItemBytes, CurrentItemSize: s.CurrentItemSize,
+		ActiveTransfers: s.ActiveTransfers,
 	}
 }
 

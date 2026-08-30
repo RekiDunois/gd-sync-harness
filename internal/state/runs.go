@@ -54,6 +54,8 @@ type SyncRun struct {
 	CurrentItem         *string `json:"current_item,omitempty"`
 	CurrentItemBytes    int64   `json:"current_item_bytes"`
 	CurrentItemSize     int64   `json:"current_item_size"`
+	ActiveTransfers     int64   `json:"active_transfers"`
+	UploadStartedAt     *string `json:"upload_started_at,omitempty"`
 	ErrorCode           string  `json:"error_code"`
 	ErrorClassification string  `json:"error_classification"`
 	Error               string  `json:"error"`
@@ -64,17 +66,17 @@ const runCols = `id, profile_id, kind, target_generation, status, phase,
 	bytes_total, bytes_completed, last_progress_at, error_code,
 	error_classification, error, last_heartbeat_at, checks_completed,
 	checks_total, items_listed, errors_count, speed_bytes_per_second,
-	current_item, current_item_bytes, current_item_size`
+	current_item, current_item_bytes, current_item_size, active_transfers, upload_started_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*SyncRun, error) {
 	var r SyncRun
-	var comp, last, phase, heartbeat, current sql.NullString
+	var comp, last, phase, heartbeat, current, uploadStarted sql.NullString
 	if err := row.Scan(&r.ID, &r.ProfileID, &r.Kind, &r.TargetGeneration,
 		&r.Status, &phase, &r.StartedAt, &comp, &r.FilesDiscovered,
 		&r.FilesCompleted, &r.BytesTotal, &r.BytesCompleted, &last,
 		&r.ErrorCode, &r.ErrorClassification, &r.Error, &heartbeat,
 		&r.ChecksCompleted, &r.ChecksTotal, &r.ItemsListed, &r.ErrorsCount,
-		&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize); err != nil {
+		&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize, &r.ActiveTransfers, &uploadStarted); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ErrNotFound
 		}
@@ -85,6 +87,7 @@ func scanRun(row interface{ Scan(...any) error }) (*SyncRun, error) {
 	r.LastProgressAt = nullStr(last)
 	r.LastHeartbeatAt = nullStr(heartbeat)
 	r.CurrentItem = nullStr(current)
+	r.UploadStartedAt = nullStr(uploadStarted)
 	return &r, nil
 }
 
@@ -93,13 +96,13 @@ func scanRuns(rows *sql.Rows) ([]*SyncRun, error) {
 	var out []*SyncRun
 	for rows.Next() {
 		var r SyncRun
-		var comp, last, phase, heartbeat, current sql.NullString
+		var comp, last, phase, heartbeat, current, uploadStarted sql.NullString
 		if err := rows.Scan(&r.ID, &r.ProfileID, &r.Kind, &r.TargetGeneration,
 			&r.Status, &phase, &r.StartedAt, &comp, &r.FilesDiscovered,
 			&r.FilesCompleted, &r.BytesTotal, &r.BytesCompleted, &last,
 			&r.ErrorCode, &r.ErrorClassification, &r.Error, &heartbeat,
 			&r.ChecksCompleted, &r.ChecksTotal, &r.ItemsListed, &r.ErrorsCount,
-			&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize); err != nil {
+			&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize, &r.ActiveTransfers, &uploadStarted); err != nil {
 			return nil, err
 		}
 		r.Phase = phase.String
@@ -107,6 +110,7 @@ func scanRuns(rows *sql.Rows) ([]*SyncRun, error) {
 		r.LastProgressAt = nullStr(last)
 		r.LastHeartbeatAt = nullStr(heartbeat)
 		r.CurrentItem = nullStr(current)
+		r.UploadStartedAt = nullStr(uploadStarted)
 		out = append(out, &r)
 	}
 	return out, rows.Err()

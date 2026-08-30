@@ -6,18 +6,26 @@ import (
 	"os"
 	"strings"
 
+	"knowledge-sync/internal/config"
 	"knowledge-sync/internal/exec"
 	"knowledge-sync/internal/state"
 )
 
 // Service performs fast-path upserts and full reconciliation through rclone.
 type Service struct {
-	Rclone *exec.Rclone
-	DB     *state.DB
+	Rclone       *exec.Rclone
+	DB           *state.DB
+	RcloneConfig config.RcloneConfig
 }
 
 // New builds the sync service.
-func New(r *exec.Rclone, db *state.DB) *Service { return &Service{Rclone: r, DB: db} }
+func New(r *exec.Rclone, db *state.DB, cfg ...config.RcloneConfig) *Service {
+	c := config.Default().Rclone
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	return &Service{Rclone: r, DB: db, RcloneConfig: c}
+}
 
 // FastUpsert uploads only the given changed files using a files-from targeted
 // copy (§12). It never deletes.
@@ -36,10 +44,9 @@ func (s *Service) FastUpsert(ctx context.Context, p *state.Profile, files []stri
 		"--files-from", list,
 		"--no-traverse",
 		"--fast-list",
-		"--transfers", "12",
-		p.SourcePath,
-		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
+	args = append(args, config.ArgsFor(config.Config{Rclone: s.RcloneConfig}, config.FastUpsert)...)
+	args = append(args, p.SourcePath, p.RemoteName+":"+p.RemoteDisplayPath)
 	res := s.Rclone.Run(ctx, args...)
 	if res.Err != nil {
 		return fmt.Errorf("fast upsert: %w: %s", res.Err, res.StderrTrimmed())
@@ -84,11 +91,12 @@ func (s *Service) DryRunSync(ctx context.Context, p *state.Profile, options Sync
 		"--files-from", list,
 		"--delete-excluded",
 		"--fast-list",
-		"--transfers", "12",
 		"--track-renames",
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
+	args = append(args[:len(args)-2], config.ArgsFor(config.Config{Rclone: s.RcloneConfig}, config.DryRun)...)
+	args = append(args, p.SourcePath, p.RemoteName+":"+p.RemoteDisplayPath)
 	res := s.Rclone.Run(ctx, args...)
 	if res.Err != nil {
 		return nil, fmt.Errorf("preflight dry-run: %w: %s", res.Err, res.StderrTrimmed())
@@ -173,12 +181,13 @@ func (s *Service) fullSync(ctx context.Context, p *state.Profile, options SyncOp
 		"--files-from", list,
 		"--delete-excluded",
 		"--fast-list",
-		"--transfers", "12",
 		"--track-renames",
 		fmt.Sprintf("--max-delete=%d", effectiveDeleteLimit(p, options)),
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
+	args = append(args[:len(args)-2], config.ArgsFor(config.Config{Rclone: s.RcloneConfig}, config.FullSync)...)
+	args = append(args, p.SourcePath, p.RemoteName+":"+p.RemoteDisplayPath)
 	res := s.Rclone.RunProgress(ctx, onStats, args...)
 	if res.Err != nil {
 		return nil, fmt.Errorf("full sync: %w: %s", res.Err, res.StderrTrimmed())
@@ -209,6 +218,8 @@ func (s *Service) VerifyCheck(ctx context.Context, p *state.Profile) error {
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
+	args = append(args[:len(args)-2], config.ArgsFor(config.Config{Rclone: s.RcloneConfig}, config.Verify)...)
+	args = append(args, p.SourcePath, p.RemoteName+":"+p.RemoteDisplayPath)
 	res := s.Rclone.Run(ctx, args...)
 	if res.Err != nil {
 		return fmt.Errorf("verify check: %w: %s", res.Err, res.StderrTrimmed())
@@ -231,6 +242,8 @@ func (s *Service) VerifyFull(ctx context.Context, p *state.Profile) error {
 		p.SourcePath,
 		p.RemoteName + ":" + p.RemoteDisplayPath,
 	}
+	args = append(args[:len(args)-2], config.ArgsFor(config.Config{Rclone: s.RcloneConfig}, config.Verify)...)
+	args = append(args, p.SourcePath, p.RemoteName+":"+p.RemoteDisplayPath)
 	res := s.Rclone.Run(ctx, args...)
 	if res.Err != nil {
 		return fmt.Errorf("verify full: %w: %s", res.Err, res.StderrTrimmed())

@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"knowledge-sync/internal/config"
 	rcexec "knowledge-sync/internal/exec"
 	"knowledge-sync/internal/flock"
 	"knowledge-sync/internal/logger"
@@ -33,6 +34,7 @@ type App struct {
 	FSWatchBin string
 	LogDir     string
 	LockDir    string
+	Config     config.Config
 }
 
 // Context returns a cancellable lifecycle context. Long data-plane operations
@@ -76,10 +78,20 @@ func NewApp() (*App, error) {
 		_ = db.SetSetting(state.SettingFSWatchBin, fswatchBin)
 	}
 	_ = db.SetSetting(state.SettingRcloneCfg, configPath)
+	appConfigPath, err := paths.AppConfigPath()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("resolve app config: %w", err)
+	}
+	appConfig, err := config.Load(appConfigPath)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load knowledge-sync config %s: %w", appConfigPath, err)
+	}
 
 	rclone := rcexec.NewRclone(rcloneBin, configPath)
 	rm := remote.New(rclone, db)
-	svc := sync.New(rclone, db)
+	svc := sync.New(rclone, db, appConfig.Rclone)
 	rec := sync.NewReconciler(svc)
 
 	logDir, _ := paths.LogsDir()
@@ -87,7 +99,7 @@ func NewApp() (*App, error) {
 	return &App{
 		DB: db, Rclone: rclone, Remote: rm, Sync: svc, Reconciler: rec,
 		ConfigPath: configPath, RcloneBin: rcloneBin, FSWatchBin: fswatchBin,
-		LogDir: logDir, LockDir: filepath.Join(mustStateDir(), "locks"), scheduler: newSyncScheduler(db),
+		LogDir: logDir, LockDir: filepath.Join(mustStateDir(), "locks"), scheduler: newSyncScheduler(db), Config: appConfig,
 	}, nil
 }
 

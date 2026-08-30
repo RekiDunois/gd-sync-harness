@@ -7,6 +7,22 @@ import (
 
 const dataDirName = "knowledge-sync"
 
+func ConfigDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", dataDirName), nil
+}
+
+func AppConfigPath() (string, error) {
+	d, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "config.json"), nil
+}
+
 // StateDir returns ~/.local/share/knowledge-sync
 func StateDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -58,6 +74,7 @@ func Ensure() error {
 		fn func() (string, error)
 	}{
 		{StateDir},
+		{ConfigDir},
 		{BackupsDir},
 		{LogsDir},
 		{LaunchAgentsDir},
