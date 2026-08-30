@@ -2,6 +2,7 @@ package state
 
 import (
 	"database/sql"
+	"time"
 )
 
 // Public top-level sync states (§11).
@@ -32,6 +33,10 @@ type ProfileSyncState struct {
 	ConsecutiveFailures   int     `json:"consecutive_failures"`
 	NextRetryAt           *string `json:"next_retry_at"`
 	LastProgressAt        *string `json:"last_progress_at"`
+	LastHeartbeatAt       *string `json:"last_heartbeat_at"`
+	ReconcileNotBeforeAt  *string `json:"reconcile_not_before_at"`
+	ReconcileDeadlineAt   *string `json:"reconcile_deadline_at"`
+	LimitedFailures       int     `json:"limited_failures"`
 	LastErrorCode         *string `json:"last_error_code"`
 	LastError             *string `json:"last_error"`
 }
@@ -52,11 +57,12 @@ func (s *ProfileSyncState) IsInitialized() bool {
 func scanSyncState(row interface{ Scan(...any) error }) (*ProfileSyncState, error) {
 	var s ProfileSyncState
 	var lsg sql.NullInt64
-	var ini, lsa, run, rc, next, lastP, errCode, errMsg, phase sql.NullString
+	var ini, lsa, run, rc, next, lastP, heartbeat, notBefore, deadline, errCode, errMsg, phase sql.NullString
 	var st string
 	if err := row.Scan(&s.ProfileID, &s.DesiredGeneration, &lsg, &ini, &lsa,
 		&run, &st, &phase, &rc, &s.ConsecutiveFailures, &next,
-		&lastP, &errCode, &errMsg); err != nil {
+		&lastP, &errCode, &errMsg, &heartbeat, &notBefore, &deadline,
+		&s.LimitedFailures); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ErrNotFound
 		}
@@ -73,6 +79,9 @@ func scanSyncState(row interface{ Scan(...any) error }) (*ProfileSyncState, erro
 	s.RetryClassification = nullStr(rc)
 	s.NextRetryAt = nullStr(next)
 	s.LastProgressAt = nullStr(lastP)
+	s.LastHeartbeatAt = nullStr(heartbeat)
+	s.ReconcileNotBeforeAt = nullStr(notBefore)
+	s.ReconcileDeadlineAt = nullStr(deadline)
 	s.LastErrorCode = nullStr(errCode)
 	s.LastError = nullStr(errMsg)
 	return &s, nil
@@ -81,7 +90,8 @@ func scanSyncState(row interface{ Scan(...any) error }) (*ProfileSyncState, erro
 const syncStateCols = `profile_id, desired_generation, last_success_generation,
 	initialized_at, last_success_at, current_run_id, state, phase,
 	retry_classification, consecutive_failures, next_retry_at,
-	last_progress_at, last_error_code, last_error`
+	last_progress_at, last_error_code, last_error, last_heartbeat_at,
+	reconcile_not_before_at, reconcile_deadline_at, limited_failures`
 
 // GetSyncState returns the sync state for a profile.
 func (d *DB) GetSyncState(profileID string) (*ProfileSyncState, error) {
@@ -105,23 +115,94 @@ func (d *DB) RequestReconcile(profileID string) error {
 	if err := d.EnsureSyncState(profileID); err != nil {
 		return err
 	}
-	if _, err := d.Exec(`UPDATE profile_sync_state
-		SET desired_generation = desired_generation + 1
-		WHERE profile_id = ?`, profileID); err != nil {
-		return err
-	}
-	_, err := d.Exec(`UPDATE profile_runtime SET reconcile_requested = 1 WHERE profile_id = ?`, profileID)
+	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = d.Exec(`UPDATE profile_sync_state SET state = CASE
+	defer tx.Rollback()
+	// A manual request is one durable opportunity, not an unconditional
+	// increment for every duplicate wake-up.
+	if _, err := tx.Exec(`UPDATE profile_sync_state SET desired_generation = MAX(
+		desired_generation,
+		COALESCE((SELECT source_generation FROM profile_runtime WHERE profile_id = ?), 0),
+		COALESCE(last_success_generation, 0) + 1
+	) WHERE profile_id = ?`, profileID, profileID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE profile_runtime SET reconcile_requested = 1 WHERE profile_id = ?`, profileID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE profile_sync_state SET state = CASE
 			WHEN state = ? THEN state -- never clobber an error gate
 			WHEN desired_generation > COALESCE(last_success_generation, 0) THEN
 				CASE WHEN last_success_generation IS NULL THEN ? ELSE ? END
 			ELSE state
 		END
-		WHERE profile_id = ?`, StateError, StateInitializing, StateSyncing, profileID)
+		WHERE profile_id = ?`, StateError, StateInitializing, StateSyncing, profileID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// EnsureReconcileGeneration coalesces full-reconcile intent at a filesystem
+// generation. Repeating the same generation is idempotent.
+func (d *DB) EnsureReconcileGeneration(profileID string, generation int64) error {
+	if generation < 1 {
+		generation = 1
+	}
+	_, err := d.Exec(`UPDATE profile_sync_state SET
+		desired_generation = MAX(desired_generation, ?),
+		state = CASE
+			WHEN state = ? THEN state
+			WHEN last_success_generation IS NULL THEN ?
+			ELSE ?
+		END
+		WHERE profile_id = ?`, generation, StateError, StateInitializing, StateSyncing, profileID)
 	return err
+}
+
+// ScheduleDestructiveReconcile persists a full intent and its debounce window.
+func (d *DB) ScheduleDestructiveReconcile(profileID string, generation int64, now time.Time) error {
+	if err := d.EnsureReconcileGeneration(profileID, generation); err != nil {
+		return err
+	}
+	notBefore := now.Add(10 * time.Second).Format(timeFmt)
+	deadline := now.Add(60 * time.Second).Format(timeFmt)
+	_, err := d.Exec(`UPDATE profile_sync_state SET
+		reconcile_not_before_at = CASE WHEN reconcile_not_before_at IS NULL OR reconcile_not_before_at < ? THEN ? ELSE reconcile_not_before_at END,
+		reconcile_deadline_at = CASE WHEN reconcile_deadline_at IS NULL THEN ? ELSE reconcile_deadline_at END
+		WHERE profile_id = ?`, notBefore, notBefore, deadline, profileID)
+	return err
+}
+
+// PromoteToFullReconcile atomically records the latest full intent, collapses
+// detailed pending paths, and starts the durable destructive debounce window.
+func (d *DB) PromoteToFullReconcile(profileID string, generation int64, now time.Time) error {
+	if generation < 1 {
+		generation = 1
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	notBefore := now.Add(10 * time.Second).Format(timeFmt)
+	deadline := now.Add(60 * time.Second).Format(timeFmt)
+	if _, err := tx.Exec(`UPDATE profile_sync_state SET
+		desired_generation = MAX(desired_generation, ?),
+		reconcile_not_before_at = CASE WHEN reconcile_not_before_at IS NULL OR reconcile_not_before_at < ? THEN ? ELSE reconcile_not_before_at END,
+		reconcile_deadline_at = CASE WHEN reconcile_deadline_at IS NULL THEN ? ELSE reconcile_deadline_at END,
+		state = CASE WHEN state = ? THEN state WHEN last_success_generation IS NULL THEN ? ELSE ? END
+		WHERE profile_id = ?`, generation, notBefore, notBefore, deadline, StateError, StateInitializing, StateSyncing, profileID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE profile_runtime SET reconcile_requested = 1 WHERE profile_id = ?`, profileID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM pending_events WHERE profile_id = ?`, profileID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ReopenSyncGate clears a durable terminal/retry gate so a fresh explicit
@@ -131,6 +212,9 @@ func (d *DB) ReopenSyncGate(profileID string) error {
 	_, err := d.Exec(`UPDATE profile_sync_state SET
 		retry_classification = NULL,
 		next_retry_at = NULL,
+		limited_failures = 0,
+		reconcile_not_before_at = NULL,
+		reconcile_deadline_at = NULL,
 		state = CASE
 			WHEN desired_generation > COALESCE(last_success_generation, 0) THEN
 				CASE WHEN last_success_generation IS NULL THEN ? ELSE ? END
@@ -150,6 +234,7 @@ const (
 	ClaimNoDebt
 	ClaimGateBlocked
 	ClaimProfileInactive
+	ClaimDeferred
 )
 
 // ClaimRun atomically claims the next reconciliation attempt for a profile.
@@ -157,7 +242,7 @@ const (
 // active run inside a single write transaction, capturing target_generation =
 // desired_generation (§24.1, §25). It returns the claimed run and the result.
 func (d *DB) ClaimRun(profileID, runID string) (*SyncRun, ClaimResult, error) {
-	return d.ClaimRunMode(profileID, runID, false)
+	return d.claimRun(profileID, runID, false, false)
 }
 
 // ClaimRunMode is ClaimRun with a force flag. When force is true the debt
@@ -166,6 +251,17 @@ func (d *DB) ClaimRun(profileID, runID string) (*SyncRun, ClaimResult, error) {
 // debt, matching the pre-existing safety-net semantics. Lifecycle, gate, and
 // single-active-run constraints always apply.
 func (d *DB) ClaimRunMode(profileID, runID string, force bool) (*SyncRun, ClaimResult, error) {
+	return d.claimRun(profileID, runID, force, force)
+}
+
+// ClaimRunWithOptions separates the debt override from the automatic
+// destructive-debounce override. Manual reconcile-now uses both; scheduled
+// safety runs use only the former.
+func (d *DB) ClaimRunWithOptions(profileID, runID string, force, bypassDebounce bool) (*SyncRun, ClaimResult, error) {
+	return d.claimRun(profileID, runID, force, bypassDebounce)
+}
+
+func (d *DB) claimRun(profileID, runID string, force, bypassDebounce bool) (*SyncRun, ClaimResult, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return nil, ClaimProfileInactive, err
@@ -187,11 +283,12 @@ func (d *DB) ClaimRunMode(profileID, runID string, force bool) (*SyncRun, ClaimR
 
 	var s ProfileSyncState
 	var lsg sql.NullInt64
-	var curRun, state, rc, next sql.NullString
+	var curRun, state, rc, next, notBefore, deadline sql.NullString
 	if err := tx.QueryRow(`SELECT desired_generation, last_success_generation,
-		current_run_id, state, COALESCE(retry_classification, ''), next_retry_at
+		current_run_id, state, COALESCE(retry_classification, ''), next_retry_at,
+		reconcile_not_before_at, reconcile_deadline_at
 		FROM profile_sync_state WHERE profile_id = ?`, profileID).
-		Scan(&s.DesiredGeneration, &lsg, &curRun, &state, &rc, &next); err != nil {
+		Scan(&s.DesiredGeneration, &lsg, &curRun, &state, &rc, &next, &notBefore, &deadline); err != nil {
 		return nil, ClaimProfileInactive, err
 	}
 	if curRun.Valid {
@@ -214,11 +311,14 @@ func (d *DB) ClaimRunMode(profileID, runID string, force bool) (*SyncRun, ClaimR
 	}
 	nowT := Now()
 	now := nowT.Format(timeFmt)
-		if state.String == StateError {
+	if !bypassDebounce && notBefore.Valid && now < notBefore.String {
+		return nil, ClaimDeferred, nil
+	}
+	if state.String == StateError {
 		if rc.String == RetryTerminal {
 			return nil, ClaimGateBlocked, nil
 		}
-		if rc.String == RetryRetryable && next.Valid && now < next.String {
+		if (rc.String == RetryRetryable || rc.String == RetryRetryableLimited) && next.Valid && now < next.String {
 			return nil, ClaimGateBlocked, nil
 		}
 	}
@@ -247,8 +347,9 @@ func (d *DB) ClaimRunMode(profileID, runID string, force bool) (*SyncRun, ClaimR
 		newState = StateSyncing
 	}
 	if _, err := tx.Exec(`UPDATE profile_sync_state SET
-		current_run_id = ?, state = ?, phase = ?, last_progress_at = ?
-		WHERE profile_id = ?`, runID, newState, PhaseQueued, now, profileID); err != nil {
+		current_run_id = ?, state = ?, phase = ?, last_progress_at = ?, last_heartbeat_at = ?,
+		reconcile_not_before_at = NULL, reconcile_deadline_at = NULL
+		WHERE profile_id = ?`, runID, newState, PhaseQueued, now, now, profileID); err != nil {
 		return nil, ClaimProfileInactive, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -289,6 +390,7 @@ func (d *DB) CommitRunSuccess(profileID, runID string, target int64) error {
 		retry_classification = NULL,
 		next_retry_at = NULL,
 		consecutive_failures = 0,
+		limited_failures = 0,
 		phase = NULL,
 		state = CASE
 			WHEN desired_generation <= MAX(COALESCE(last_success_generation, 0), ?) THEN ?
@@ -298,10 +400,14 @@ func (d *DB) CommitRunSuccess(profileID, runID string, target int64) error {
 		target, now, now, target, StateReady, StateSyncing, profileID); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM pending_events WHERE profile_id = ? AND source_generation <= ?`, profileID, target); err != nil {
+		return err
+	}
 	// Backward-compatible runtime markers.
 	if _, err := tx.Exec(`UPDATE profile_runtime SET
-		last_reconcile_success = ?, reconcile_requested = 0, last_error = NULL
-		WHERE profile_id = ?`, now, profileID); err != nil {
+		last_reconcile_success = ?, reconcile_requested = CASE
+			WHEN (SELECT desired_generation FROM profile_sync_state WHERE profile_id = ?) > ? THEN 1 ELSE 0 END,
+		last_error = NULL WHERE profile_id = ?`, now, profileID, target, profileID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -319,15 +425,8 @@ func (d *DB) CommitRunFailure(profileID, runID string, f RunFailure) error {
 
 	nowT := Now()
 	now := nowT.Format(timeFmt)
-	if _, err := tx.Exec(`UPDATE sync_runs SET status = ?, completed_at = ?,
-		error_code = ?, error_classification = ?, error = ?
-		WHERE id = ? AND profile_id = ? AND status = ?`,
-		RunFailed, now, f.Code, f.Classification, f.Message, runID, profileID, RunRunning); err != nil {
-		return err
-	}
-
 	var nextRetry interface{}
-	if f.Classification == RetryRetryable {
+	if f.Classification == RetryRetryable && f.Code != WorkerInterruptedCode {
 		var cur int
 		if err := tx.QueryRow(`SELECT consecutive_failures FROM profile_sync_state
 			WHERE profile_id = ?`, profileID).Scan(&cur); err != nil {
@@ -342,6 +441,31 @@ func (d *DB) CommitRunFailure(profileID, runID string, f RunFailure) error {
 			return err
 		}
 	}
+	if f.Classification == RetryRetryableLimited {
+		var cur int
+		if err := tx.QueryRow(`SELECT limited_failures FROM profile_sync_state WHERE profile_id = ?`, profileID).Scan(&cur); err != nil {
+			return err
+		}
+		cur++
+		if cur > 3 {
+			f.Classification = RetryTerminal
+			f.Code = "unknown_error_limit"
+		} else {
+			nextRetry = nowT.Add(LimitedRetryBackoff(cur)).Format(timeFmt)
+			if _, err := tx.Exec(`UPDATE profile_sync_state SET limited_failures = ?, next_retry_at = ? WHERE profile_id = ?`, cur, nextRetry, profileID); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`UPDATE sync_runs SET status = ?, completed_at = ?,
+		error_code = ?, error_classification = ?, error = ?
+		WHERE id = ? AND profile_id = ? AND status = ?`,
+		RunFailed, now, f.Code, f.Classification, f.Message, runID, profileID, RunRunning); err != nil {
+		return err
+	}
+	if f.Code == WorkerInterruptedCode {
+		nextRetry = now
+	}
 
 	if _, err := tx.Exec(`UPDATE profile_sync_state SET
 		current_run_id = NULL,
@@ -350,9 +474,10 @@ func (d *DB) CommitRunFailure(profileID, runID string, f RunFailure) error {
 		last_error_code = ?,
 		last_error = ?,
 		retry_classification = ?,
-		next_retry_at = COALESCE(next_retry_at, ?)
+		next_retry_at = ?,
+		last_heartbeat_at = ?
 		WHERE profile_id = ?`,
-		StateError, f.Code, f.Message, f.Classification, nextRetry, profileID); err != nil {
+		StateError, f.Code, f.Message, f.Classification, nextRetry, now, profileID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE profile_runtime SET last_error = ? WHERE profile_id = ?`,
@@ -397,13 +522,13 @@ func (d *DB) OrphanCurrentRun(profileID string) error {
 
 // UpdateRunPhase records the current phase on the active run.
 func (d *DB) UpdateRunPhase(profileID, runID, phase string) error {
-	now := Now().Format(timeFmt)
-	if _, err := d.Exec(`UPDATE sync_runs SET phase = ?, last_progress_at = ?
+	if _, err := d.Exec(`UPDATE sync_runs SET phase = ?
 		WHERE id = ? AND profile_id = ? AND status = ?`,
-		phase, now, runID, profileID, RunRunning); err != nil {
+		phase, runID, profileID, RunRunning); err != nil {
 		return err
 	}
-	return d.touchLastProgress(profileID, now)
+	_, err := d.Exec(`UPDATE profile_sync_state SET phase = ? WHERE profile_id = ?`, phase, profileID)
+	return err
 }
 
 // UpdateRunFilesDiscovered records the discovered file count for a run.
@@ -414,23 +539,53 @@ func (d *DB) UpdateRunFilesDiscovered(profileID, runID string, files int64) erro
 		files, now, runID, profileID, RunRunning); err != nil {
 		return err
 	}
-	return d.touchLastProgress(profileID, now)
+	_, err := d.Exec(`UPDATE profile_sync_state SET last_progress_at = ?, last_heartbeat_at = ? WHERE profile_id = ?`, now, now, profileID)
+	return err
 }
 
-// UpdateRunProgress persists best-effort transfer counters (§10.1).
-func (d *DB) UpdateRunProgress(profileID, runID string, filesDone, bytesDone, bytesTotal int64) error {
+// UpdateRunHeartbeat records telemetry without treating it as measurable work.
+func (d *DB) UpdateRunHeartbeat(profileID, runID string) error {
 	now := Now().Format(timeFmt)
-	if _, err := d.Exec(`UPDATE sync_runs SET files_completed = ?, bytes_completed = ?,
-		bytes_total = ?, last_progress_at = ?
+	if _, err := d.Exec(`UPDATE sync_runs SET last_heartbeat_at = ?
 		WHERE id = ? AND profile_id = ? AND status = ?`,
-		filesDone, bytesDone, bytesTotal, now, runID, profileID, RunRunning); err != nil {
+		now, runID, profileID, RunRunning); err != nil {
 		return err
 	}
-	return d.touchLastProgress(profileID, now)
+	_, err := d.Exec(`UPDATE profile_sync_state SET last_heartbeat_at = ? WHERE profile_id = ?`, now, profileID)
+	return err
 }
 
-func (d *DB) touchLastProgress(profileID, now string) error {
-	_, err := d.Exec(`UPDATE profile_sync_state SET last_progress_at = ? WHERE profile_id = ?`,
-		now, profileID)
+// ProgressSnapshot keeps the state package independent from rclone's parser.
+type ProgressSnapshot struct {
+	FilesCompleted, BytesCompleted, BytesTotal             int64
+	ChecksCompleted, ChecksTotal, ItemsListed, ErrorsCount int64
+	SpeedBytesPerSecond                                    float64
+	CurrentItem                                            *string
+	CurrentItemBytes, CurrentItemSize                      int64
+}
+
+// UpdateRunStats persists structured telemetry. last_progress_at changes only
+// when measurable is true; every valid frame updates last_heartbeat_at.
+func (d *DB) UpdateRunStats(profileID, runID string, s ProgressSnapshot, measurable bool) error {
+	now := Now().Format(timeFmt)
+	var progress interface{}
+	if measurable {
+		progress = now
+	}
+	if _, err := d.Exec(`UPDATE sync_runs SET files_completed = ?, bytes_completed = ?, bytes_total = ?,
+		last_heartbeat_at = ?, checks_completed = ?, checks_total = ?, items_listed = ?, errors_count = ?,
+		speed_bytes_per_second = ?, current_item = ?, current_item_bytes = ?, current_item_size = ?,
+		last_progress_at = COALESCE(?, last_progress_at)
+		WHERE id = ? AND profile_id = ? AND status = ?`,
+		s.FilesCompleted, s.BytesCompleted, s.BytesTotal, now, s.ChecksCompleted, s.ChecksTotal,
+		s.ItemsListed, s.ErrorsCount, s.SpeedBytesPerSecond, s.CurrentItem, s.CurrentItemBytes,
+		s.CurrentItemSize, progress, runID, profileID, RunRunning); err != nil {
+		return err
+	}
+	if measurable {
+		_, err := d.Exec(`UPDATE profile_sync_state SET last_heartbeat_at = ?, last_progress_at = ? WHERE profile_id = ?`, now, now, profileID)
+		return err
+	}
+	_, err := d.Exec(`UPDATE profile_sync_state SET last_heartbeat_at = ? WHERE profile_id = ?`, now, profileID)
 	return err
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"knowledge-sync/internal/filter"
 	"knowledge-sync/internal/state"
@@ -33,11 +34,23 @@ type ScanResult struct {
 	SkippedOversize []string
 }
 
+type ScanProgress struct {
+	Visited  int
+	Eligible int
+}
+
 // ScanLocal walks the profile source applying the structured filter, returning
 // the eligible file set.
 func ScanLocal(p *state.Profile) (*ScanResult, error) {
+	return ScanLocalProgress(p, nil)
+}
+
+// ScanLocalProgress is ScanLocal with a time-throttled progress callback.
+func ScanLocalProgress(p *state.Profile, onProgress func(ScanProgress)) (*ScanResult, error) {
 	eng := filter.FromProfile(p)
 	res := &ScanResult{}
+	visited := 0
+	lastReport := time.Time{}
 	err := filepath.Walk(p.SourcePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -45,6 +58,7 @@ func ScanLocal(p *state.Profile) (*ScanResult, error) {
 		if path == p.SourcePath {
 			return nil
 		}
+		visited++
 		rel := filter.NormalizeRelPath(p.SourcePath, path)
 		if rel == "" {
 			return nil
@@ -71,12 +85,19 @@ func ScanLocal(p *state.Profile) (*ScanResult, error) {
 			Size:    info.Size(),
 			ModTime: info.ModTime().Unix(),
 		})
+		if onProgress != nil && (lastReport.IsZero() || time.Since(lastReport) >= time.Second) {
+			onProgress(ScanProgress{Visited: visited, Eligible: len(res.Entries)})
+			lastReport = time.Now()
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	sort.Slice(res.Entries, func(i, j int) bool { return res.Entries[i].RelPath < res.Entries[j].RelPath })
+	if onProgress != nil {
+		onProgress(ScanProgress{Visited: visited, Eligible: len(res.Entries)})
+	}
 	return res, nil
 }
 

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -66,8 +67,20 @@ func runReconcile(app *App, p *state.Profile, options sync.SyncOptions, schedule
 	// scheduled reconcile and explicit reconcile-now run a full reconciliation
 	// even with no known debt (to catch remote drift), while the event-driven
 	// worker pass remains strictly debt-driven.
+	// Scheduled reconciliation must respect the durable destructive debounce;
+	// explicit reconcile-now is allowed to bypass it. Both retain the safety-net
+	// behavior of running even when no generation debt is known.
+	ctx, cancel := app.Context()
+	defer cancel()
+	lease := leaseID()
+	if err := app.DB.AcquireRemoteLease(ctx, p.RemoteName, 1, 2, os.Getpid(), lease); err != nil {
+		return err
+	}
+	stopRenewal := startLeaseRenewal(ctx, app.DB, lease)
+	defer stopRenewal()
+	defer app.DB.ReleaseRemoteLease(lease)
 	force := true
-	run, res, err := app.DB.ClaimRunMode(p.ID, newRunID(), force)
+	run, res, err := app.DB.ClaimRunWithOptions(p.ID, newRunID(), force, !scheduled)
 	if err != nil {
 		return err
 	}
@@ -104,6 +117,8 @@ func runReconcile(app *App, p *state.Profile, options sync.SyncOptions, schedule
 		if !scheduled {
 			fmt.Printf("reconcile %s: nothing to reconcile\n", p.ID)
 		}
+		return nil
+	case state.ClaimDeferred:
 		return nil
 	case state.ClaimProfileInactive:
 		return fmt.Errorf("profile %q is not eligible for reconciliation (disabled, tombstoned, or deleting)", p.ID)

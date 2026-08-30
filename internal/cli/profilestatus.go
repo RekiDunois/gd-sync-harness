@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"knowledge-sync/internal/state"
+	"knowledge-sync/pkg/version"
 )
 
 func profileStatusCmd() *cobra.Command {
@@ -62,6 +63,7 @@ func renderProfileSyncStatus(app *App, id string) error {
 	}
 
 	fmt.Printf("Profile: %s\n", p.ID)
+	fmt.Printf("CLI binary: %s\n", version.String())
 	fmt.Printf("Initialized: %s\n", initStr)
 	fmt.Printf("State:   %s\n", ss.State)
 	if ss.Phase != "" {
@@ -99,17 +101,30 @@ func renderProfileSyncStatus(app *App, id string) error {
 	if run := currentRun(app, id, ss); run != nil {
 		fmt.Printf("Run:     %s (%s, generation %d)\n", run.ID, run.Kind, run.TargetGeneration)
 		if run.FilesDiscovered > 0 {
-			fmt.Printf("Discovered files: %d\n", run.FilesDiscovered)
+			fmt.Printf("Local discovered: %d\n", run.FilesDiscovered)
 		}
 		if run.FilesCompleted > 0 {
-			fmt.Printf("Completed files:  %d\n", run.FilesCompleted)
+			fmt.Printf("Transferred files: %d\n", run.FilesCompleted)
 		}
+		fmt.Printf("Listed: %d\n", run.ItemsListed)
+		fmt.Printf("Checked: %d", run.ChecksCompleted)
+		if run.ChecksTotal > 0 {
+			fmt.Printf(" / %d", run.ChecksTotal)
+		}
+		fmt.Println()
 		if run.BytesCompleted > 0 {
 			total := "calculating"
 			if run.BytesTotal > 0 {
 				total = humanBytes(run.BytesTotal)
 			}
 			fmt.Printf("Transferred:      %s / %s\n", humanBytes(run.BytesCompleted), total)
+		}
+		if run.SpeedBytesPerSecond > 0 {
+			fmt.Printf("Speed:             %s/s\n", humanBytes(int64(run.SpeedBytesPerSecond)))
+		}
+		if run.CurrentItem != nil {
+			fmt.Printf("Current:           %s (%s / %s)\n", *run.CurrentItem,
+				humanBytes(run.CurrentItemBytes), humanBytes(run.CurrentItemSize))
 		}
 		if t, err := parseTime(run.StartedAt); err == nil {
 			fmt.Printf("Started: %s ago\n", humanDuration(time.Since(t)))
@@ -118,6 +133,17 @@ func renderProfileSyncStatus(app *App, id string) error {
 	if ss.LastProgressAt != nil {
 		if t, err := parseTime(*ss.LastProgressAt); err == nil {
 			fmt.Printf("Last progress: %s ago\n", humanDuration(time.Since(t)))
+		}
+	}
+	if ss.LastHeartbeatAt != nil {
+		if t, err := parseTime(*ss.LastHeartbeatAt); err == nil {
+			fmt.Printf("Last heartbeat: %s ago\n", humanDuration(time.Since(t)))
+		}
+	}
+	if run := currentRun(app, id, ss); run != nil && ss.LastProgressAt != nil {
+		if t, err := parseTime(*ss.LastProgressAt); err == nil && time.Since(t) >= 30*time.Minute {
+			fmt.Println("Warning: possible stall")
+			fmt.Println("No measurable progress for 30m; rclone was not cancelled")
 		}
 	}
 	return nil

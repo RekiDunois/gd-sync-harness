@@ -3,6 +3,7 @@ package sidecar
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -22,6 +23,17 @@ type Sidecar struct {
 	CreatedAt      string `json:"created_at"`
 	RemoteName     string `json:"remote_name"`
 }
+
+// ValidationError distinguishes a permanent ownership mismatch from an
+// ownership check that could not be completed because transport was temporary.
+type ValidationError struct {
+	Code      string
+	Temporary bool
+	Err       error
+}
+
+func (e *ValidationError) Error() string { return e.Code + ": " + e.Err.Error() }
+func (e *ValidationError) Unwrap() error { return e.Err }
 
 const schemaVersion = 1
 
@@ -106,19 +118,29 @@ func Exists(ctx context.Context, r *exec.Rclone, remote, profileUUID string) (bo
 func Validate(ctx context.Context, r *exec.Rclone, p *state.Profile, remotePath string) error {
 	sc, err := Read(ctx, r, p.RemoteName, SidecarPath(p.ProfileUUID))
 	if err != nil {
-		return fmt.Errorf("ownership fail: sidecar missing/unreadable: %w", err)
+		temporary := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		var exitErr interface{ ExitCode() int }
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 5 {
+			temporary = true
+		}
+		code := "ownership_missing"
+		if temporary {
+			code = "ownership_unavailable"
+		}
+		return &ValidationError{Code: code, Temporary: temporary,
+			Err: fmt.Errorf("ownership fail: sidecar missing/unreadable: %w", err)}
 	}
 	if sc.ProfileUUID != p.ProfileUUID {
-		return fmt.Errorf("ownership fail: sidecar UUID %q != profile UUID %q", sc.ProfileUUID, p.ProfileUUID)
+		return &ValidationError{Code: "ownership_uuid_mismatch", Err: fmt.Errorf("ownership fail: sidecar UUID %q != profile UUID %q", sc.ProfileUUID, p.ProfileUUID)}
 	}
 	if sc.RemoteFolderID != p.RemoteFolderID {
-		return fmt.Errorf("ownership fail: sidecar folder_id %q != profile folder_id %q", sc.RemoteFolderID, p.RemoteFolderID)
+		return &ValidationError{Code: "ownership_folder_mismatch", Err: fmt.Errorf("ownership fail: sidecar folder_id %q != profile folder_id %q", sc.RemoteFolderID, p.RemoteFolderID)}
 	}
 	if sc.RemoteName != p.RemoteName {
-		return fmt.Errorf("ownership fail: sidecar remote %q != profile remote %q", sc.RemoteName, p.RemoteName)
+		return &ValidationError{Code: "ownership_remote_mismatch", Err: fmt.Errorf("ownership fail: sidecar remote %q != profile remote %q", sc.RemoteName, p.RemoteName)}
 	}
-	if !strings.HasPrefix(path.Clean("/"+sc.RemoteFolderID+"/"), "/") {
-		return fmt.Errorf("ownership fail: malformed folder id %q", sc.RemoteFolderID)
+	if sc.SchemaVersion != schemaVersion || sc.ProfileID != p.ID || sc.RemoteFolderID == "" || strings.ContainsAny(sc.RemoteFolderID, "/\\") || path.Clean(sc.RemoteFolderID) != sc.RemoteFolderID {
+		return &ValidationError{Code: "ownership_metadata_malformed", Err: fmt.Errorf("ownership fail: malformed sidecar metadata")}
 	}
 	return nil
 }

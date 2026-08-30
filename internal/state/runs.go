@@ -20,48 +20,61 @@ const (
 
 // Run phase values (internal granularity, §11).
 const (
-	PhaseQueued     = "queued"
-	PhaseScanning   = "scanning"
-	PhasePlanning   = "planning"
-	PhaseUploading  = "uploading"
+	PhaseQueued      = "queued"
+	PhaseScanning    = "scanning"
+	PhasePlanning    = "planning"
+	PhaseUploading   = "uploading"
 	PhaseDownloading = "downloading"
-	PhaseDeleting   = "deleting"
+	PhaseDeleting    = "deleting"
 	PhaseReconciling = "reconciling"
-	PhaseFinalizing = "finalizing"
+	PhaseFinalizing  = "finalizing"
 )
 
 // SyncRun is one execution attempt of reconciliation (§8).
 type SyncRun struct {
-	ID                 string  `json:"id"`
-	ProfileID          string  `json:"profile_id"`
-	Kind               string  `json:"kind"`
-	TargetGeneration   int64   `json:"target_generation"`
-	Status             string  `json:"status"`
-	Phase              string  `json:"phase"`
-	StartedAt          string  `json:"started_at"`
-	CompletedAt        *string `json:"completed_at,omitempty"`
-	FilesDiscovered    int64   `json:"files_discovered"`
-	FilesCompleted     int64   `json:"files_completed"`
-	BytesTotal         int64   `json:"bytes_total"`
-	BytesCompleted     int64   `json:"bytes_completed"`
-	LastProgressAt     *string `json:"last_progress_at,omitempty"`
-	ErrorCode          string  `json:"error_code"`
-	ErrorClassification string `json:"error_classification"`
-	Error              string  `json:"error"`
+	ID                  string  `json:"id"`
+	ProfileID           string  `json:"profile_id"`
+	Kind                string  `json:"kind"`
+	TargetGeneration    int64   `json:"target_generation"`
+	Status              string  `json:"status"`
+	Phase               string  `json:"phase"`
+	StartedAt           string  `json:"started_at"`
+	CompletedAt         *string `json:"completed_at,omitempty"`
+	FilesDiscovered     int64   `json:"files_discovered"`
+	FilesCompleted      int64   `json:"files_completed"`
+	BytesTotal          int64   `json:"bytes_total"`
+	BytesCompleted      int64   `json:"bytes_completed"`
+	LastProgressAt      *string `json:"last_progress_at,omitempty"`
+	LastHeartbeatAt     *string `json:"last_heartbeat_at,omitempty"`
+	ChecksCompleted     int64   `json:"checks_completed"`
+	ChecksTotal         int64   `json:"checks_total"`
+	ItemsListed         int64   `json:"items_listed"`
+	ErrorsCount         int64   `json:"errors_count"`
+	SpeedBytesPerSecond float64 `json:"speed_bytes_per_second"`
+	CurrentItem         *string `json:"current_item,omitempty"`
+	CurrentItemBytes    int64   `json:"current_item_bytes"`
+	CurrentItemSize     int64   `json:"current_item_size"`
+	ErrorCode           string  `json:"error_code"`
+	ErrorClassification string  `json:"error_classification"`
+	Error               string  `json:"error"`
 }
 
 const runCols = `id, profile_id, kind, target_generation, status, phase,
 	started_at, completed_at, files_discovered, files_completed,
 	bytes_total, bytes_completed, last_progress_at, error_code,
-	error_classification, error`
+	error_classification, error, last_heartbeat_at, checks_completed,
+	checks_total, items_listed, errors_count, speed_bytes_per_second,
+	current_item, current_item_bytes, current_item_size`
 
 func scanRun(row interface{ Scan(...any) error }) (*SyncRun, error) {
 	var r SyncRun
-	var comp, last, phase sql.NullString
+	var comp, last, phase, heartbeat, current sql.NullString
 	if err := row.Scan(&r.ID, &r.ProfileID, &r.Kind, &r.TargetGeneration,
 		&r.Status, &phase, &r.StartedAt, &comp, &r.FilesDiscovered,
 		&r.FilesCompleted, &r.BytesTotal, &r.BytesCompleted, &last,
-		&r.ErrorCode, &r.ErrorClassification, &r.Error); err != nil {
+		&r.ErrorCode, &r.ErrorClassification, &r.Error, &heartbeat,
+		&r.ChecksCompleted, &r.ChecksTotal, &r.ItemsListed, &r.ErrorsCount,
+		&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ErrNotFound
 		}
@@ -70,6 +83,8 @@ func scanRun(row interface{ Scan(...any) error }) (*SyncRun, error) {
 	r.Phase = phase.String
 	r.CompletedAt = nullStr(comp)
 	r.LastProgressAt = nullStr(last)
+	r.LastHeartbeatAt = nullStr(heartbeat)
+	r.CurrentItem = nullStr(current)
 	return &r, nil
 }
 
@@ -78,16 +93,20 @@ func scanRuns(rows *sql.Rows) ([]*SyncRun, error) {
 	var out []*SyncRun
 	for rows.Next() {
 		var r SyncRun
-		var comp, last, phase sql.NullString
+		var comp, last, phase, heartbeat, current sql.NullString
 		if err := rows.Scan(&r.ID, &r.ProfileID, &r.Kind, &r.TargetGeneration,
 			&r.Status, &phase, &r.StartedAt, &comp, &r.FilesDiscovered,
 			&r.FilesCompleted, &r.BytesTotal, &r.BytesCompleted, &last,
-			&r.ErrorCode, &r.ErrorClassification, &r.Error); err != nil {
+			&r.ErrorCode, &r.ErrorClassification, &r.Error, &heartbeat,
+			&r.ChecksCompleted, &r.ChecksTotal, &r.ItemsListed, &r.ErrorsCount,
+			&r.SpeedBytesPerSecond, &current, &r.CurrentItemBytes, &r.CurrentItemSize); err != nil {
 			return nil, err
 		}
 		r.Phase = phase.String
 		r.CompletedAt = nullStr(comp)
 		r.LastProgressAt = nullStr(last)
+		r.LastHeartbeatAt = nullStr(heartbeat)
+		r.CurrentItem = nullStr(current)
 		out = append(out, &r)
 	}
 	return out, rows.Err()

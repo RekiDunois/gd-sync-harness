@@ -50,7 +50,7 @@ func TestSyncNowAndReconcileEndToEnd(t *testing.T) {
 	app := &App{
 		DB: db, Rclone: r,
 		Sync: sync.New(r, db), Reconciler: sync.NewReconciler(sync.New(r, db)),
-		Remote: remote.New(r, db), scheduler: newSyncScheduler(),
+		Remote: remote.New(r, db), LockDir: filepath.Join(t.TempDir(), "locks"), scheduler: newSyncScheduler(db),
 	}
 
 	// Write a file locally.

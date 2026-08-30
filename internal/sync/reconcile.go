@@ -32,6 +32,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, p *state.Profile, options Sy
 // ReconcileProgress is Reconcile with best-effort transfer progress callbacks
 // (§10.1). onStats may be nil.
 func (r *Reconciler) ReconcileProgress(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats)) (*PreflightResult, error) {
+	return r.reconcileProgress(ctx, p, options, onStats, nil)
+}
+
+// ReconcileProgressWithPhase exposes the real planning/uploading boundary to
+// status without duplicating the reconciliation algorithm.
+func (r *Reconciler) ReconcileProgressWithPhase(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats), onPhase func(string)) (*PreflightResult, error) {
+	return r.reconcileProgress(ctx, p, options, onStats, onPhase)
+}
+
+func (r *Reconciler) reconcileProgress(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats), onPhase func(string)) (*PreflightResult, error) {
+	if onPhase != nil {
+		onPhase(state.PhasePlanning)
+	}
 	pre, err := r.Preflight(ctx, p, options)
 	if err != nil {
 		return nil, err
@@ -44,6 +57,9 @@ func (r *Reconciler) ReconcileProgress(ctx context.Context, p *state.Profile, op
 	}
 	if pre.ToDelete > effectiveDeleteLimit(p, options) {
 		return pre, ErrDeleteBudgetExceeded
+	}
+	if onPhase != nil {
+		onPhase(state.PhaseUploading)
 	}
 	if _, err := r.Service.fullSync(ctx, p, options, onStats); err != nil {
 		return pre, err
@@ -89,7 +105,11 @@ func (r *Reconciler) markDirtyIfChanged(ctx context.Context, p *state.Profile, p
 		return err
 	}
 	if scan.ChangedFingerprint() != pre.SourceFingerprint {
-		return r.Service.DB.RequestReconcile(p.ID)
+		gen, err := r.Service.DB.BumpGeneration(p.ID)
+		if err != nil {
+			return err
+		}
+		return r.Service.DB.EnsureReconcileGeneration(p.ID, gen)
 	}
 	return nil
 }

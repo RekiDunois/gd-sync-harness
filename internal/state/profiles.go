@@ -168,7 +168,9 @@ func (d *DB) CreateProfile(p *Profile) error {
 	); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`INSERT INTO profile_runtime (profile_id) VALUES (?)`, p.ID); err != nil {
+	// Generation one is the durable initial-sync epoch. Subsequent filesystem
+	// events therefore always advance beyond the initial target generation.
+	if _, err := tx.Exec(`INSERT INTO profile_runtime (profile_id, source_generation) VALUES (?, 1)`, p.ID); err != nil {
 		return err
 	}
 	// A new profile always records durable reconciliation intent: the initial

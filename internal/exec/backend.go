@@ -5,27 +5,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 )
-
-// DefaultTimeout is the default rclone invocation timeout.
-const DefaultTimeout = 10 * time.Minute
 
 // NewRclone constructs an Rclone wrapper with sensible defaults.
 func NewRclone(binary, configPath string) *Rclone {
 	return &Rclone{
 		Binary:     binary,
 		ConfigPath: configPath,
-		Timeout:    DefaultTimeout,
+		// Long data-plane operations are governed by rclone's transport
+		// timeouts. Callers may set Timeout explicitly for short probes.
+		Timeout: 0,
 	}
 }
 
 // Feature describes a rclone backend feature.
 type Feature struct {
-	Name   string `json:"Name"`
-	Root   string `json:"Root"`
-	String string `json:"String"`
-	Hashes []string
+	Name     string `json:"Name"`
+	Root     string `json:"Root"`
+	String   string `json:"String"`
+	Hashes   []string
 	Features struct {
 		About bool `json:"About"`
 	} `json:"Features"`

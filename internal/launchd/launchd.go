@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"text/template"
+	"time"
 )
 
 // JobKind distinguishes the per-profile jobs.
@@ -19,11 +21,11 @@ const (
 
 // Config holds everything needed to render a plist.
 type Config struct {
-	LabelPrefix string
-	ProfileID   string
-	Kind        JobKind
-	Binary      string
-	LogDir      string
+	LabelPrefix   string
+	ProfileID     string
+	Kind          JobKind
+	Binary        string
+	LogDir        string
 	ReconcileHour int
 	ReconcileMin  int
 }
@@ -47,6 +49,17 @@ func (c Config) PlistPath(launchAgentsDir string) string {
 	return filepath.Join(launchAgentsDir, c.PlistFilename())
 }
 
+// Command maps job identity to the executable's CLI entrypoint. The reconcile
+// label remains stable while its runtime command is deliberately distinct.
+func (c Config) Command() string {
+	switch c.Kind {
+	case JobReconcile:
+		return "reconcile-scheduled"
+	default:
+		return string(c.Kind)
+	}
+}
+
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -56,7 +69,7 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	<key>ProgramArguments</key>
 	<array>
 		<string>{{.Binary}}</string>
-		<string>{{.Kind}}</string>
+		<string>{{.Command}}</string>
 		<string>{{.ProfileID}}</string>
 	</array>
 	<key>WorkingDirectory</key>
@@ -126,7 +139,28 @@ func (c Config) Load(launchAgentsDir string) error {
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}
-	return launchctlBootstrap(path)
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = launchctlBootstrap(path)
+		if err == nil || !isTransientBootstrapError(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	return err
+}
+
+// Reload applies a new plist to a possibly-loaded service. bootout is
+// intentionally best-effort for an absent job; bootstrap alone does not
+// replace launchd's already-loaded configuration.
+func (c Config) Reload(launchAgentsDir string) error {
+	if err := launchctlBootout(c.Label()); err != nil {
+		return err
+	}
+	if _, err := c.Install(launchAgentsDir); err != nil {
+		return err
+	}
+	return c.Load(launchAgentsDir)
 }
 
 // Unload tells launchctl to unload (bootout) the job.
@@ -135,7 +169,7 @@ func (c Config) Unload() error {
 }
 
 func launchctlBootstrap(path string) error {
-	out, err := exec.Command("launchctl", "bootstrap", "gui/"+uid(), path).CombinedOutput()
+	out, err := launchctlRun("bootstrap", "gui/"+uid(), path)
 	if err != nil {
 		if isAlreadyLoaded(out) {
 			return nil
@@ -146,7 +180,7 @@ func launchctlBootstrap(path string) error {
 }
 
 func launchctlBootout(label string) error {
-	out, err := exec.Command("launchctl", "bootout", "gui/"+uid()+"/"+label).CombinedOutput()
+	out, err := launchctlRun("bootout", "gui/"+uid()+"/"+label)
 	if err != nil {
 		if isNotLoaded(out) {
 			return nil
@@ -165,8 +199,16 @@ func isAlreadyLoaded(out []byte) bool {
 
 func isNotLoaded(out []byte) bool {
 	s := lower(string(out))
-	return contains(s, "could not find") || contains(s, "no such process") || contains(s, "bootout")
+	return contains(s, "could not find") || contains(s, "no such process") || contains(s, "service not found")
 }
 
-func lower(s string) string          { return stringsToLower(s) }
-func contains(s, sub string) bool    { return stringsContains(s, sub) }
+func isTransientBootstrapError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "input/output error")
+}
+
+var launchctlRun = func(args ...string) ([]byte, error) {
+	return exec.Command("launchctl", args...).CombinedOutput()
+}
+
+func lower(s string) string       { return stringsToLower(s) }
+func contains(s, sub string) bool { return stringsContains(s, sub) }

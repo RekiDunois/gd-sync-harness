@@ -42,7 +42,7 @@ func newInstallCmd() *cobra.Command {
 				}
 				installed++
 			}
-			if installed > 0 && len(targets) == 0 {
+			if installed > 0 {
 				if err := installWorkerJob(app); err != nil {
 					return fmt.Errorf("install worker: %w", err)
 				}

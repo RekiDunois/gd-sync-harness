@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -16,10 +15,6 @@ import (
 	"knowledge-sync/internal/sync"
 	"knowledge-sync/internal/watch"
 )
-
-// reconcileDestructiveDebounce is the §14 settle delay before a destructive
-// event triggers full reconciliation (RECONCILE_SETTLE_SECONDS).
-const reconcileDestructiveDebounce = 10 * time.Second
 
 func newWatchCmd() *cobra.Command {
 	return &cobra.Command{
@@ -64,40 +59,36 @@ func runWatcher(app *App, p *state.Profile) error {
 		Settings:   watch.DefaultFastSettings(),
 		Filter:     filter.FromProfile(p),
 		OnBatch: func(ctx context.Context, changed []string) error {
-			var eligible []string
-			for _, rel := range changed {
-				abs := joinSource(p.SourcePath, rel)
-				if _, err := os.Stat(abs); err != nil {
-					continue
+			return app.withProfileLock(p, func() error {
+				ss, _ := app.DB.GetSyncState(p.ID)
+				if ss != nil && ss.HasDebt() {
+					return nil
 				}
-				eligible = append(eligible, rel)
-			}
-			if len(eligible) == 0 {
-				return nil
-			}
-			if err := app.upsertForProfile(ctx, p, eligible); err != nil {
-				lg.Printf("fast upsert failed: %v", err)
-				return err
-			}
-			_ = app.DB.ClearPendingPaths(p.ID, eligible)
-			_ = app.DB.MarkFastSuccess(p.ID)
-			return nil
+				var eligible []string
+				for _, rel := range changed {
+					if _, err := os.Stat(joinSource(p.SourcePath, rel)); err == nil {
+						eligible = append(eligible, rel)
+					}
+				}
+				if len(eligible) == 0 {
+					return nil
+				}
+				if err := app.upsertForProfile(ctx, p, eligible); err != nil {
+					lg.Printf("fast upsert failed: %v", err)
+					return err
+				}
+				return app.DB.MarkFastSuccess(p.ID)
+			})
 		},
 		OnReconcile: func(ctx context.Context) error {
-			// §14: destructive events get a dedicated debounce then a full
-			// reconciliation. Reconciliation is serialized by the per-profile
-			// lock and routed through the atomic claim path; run it
-			// asynchronously so the watcher's read/debounce loops are not
-			// blocked. The hourly job remains the safety net.
-			lg.Printf("destructive event: scheduling full reconciliation")
-			go func() {
-				time.Sleep(reconcileDestructiveDebounce)
-				if err := runReconcile(app, p, sync.SyncOptions{}, true); err != nil {
-					lg.Printf("destructive reconcile: %v", err)
-				}
-			}()
-			return nil
+			rt, err := app.DB.GetRuntime(p.ID)
+			if err != nil {
+				return err
+			}
+			lg.Printf("destructive event: durable full reconciliation scheduled")
+			return app.DB.ScheduleDestructiveReconcile(p.ID, rt.SourceGeneration, state.Now())
 		},
+		OnCatchUp: func(ctx context.Context) error { return runWatcherCatchUp(ctx, app, p) },
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -117,6 +108,43 @@ func runWatcher(app *App, p *state.Profile) error {
 		lg.Printf("stop error: %v", err)
 	}
 	_ = app.DB.SetWatcherStatus(p.ID, state.WatcherStopped)
+	return nil
+}
+
+// runWatcherCatchUp compares the current local manifest with the last durable
+// manifest after fswatch is live, recovering changes made while the watcher
+// was stopped without materializing a large initial pending queue.
+func runWatcherCatchUp(ctx context.Context, app *App, p *state.Profile) error {
+	scan, err := sync.ScanLocal(p)
+	if err != nil {
+		return err
+	}
+	manifest, err := app.DB.ManifestAll(p.ID)
+	if err != nil {
+		return err
+	}
+	changed, deletes, _ := sync.DiffLocalManifest(scan, manifest)
+	if len(deletes) > 0 {
+		for _, rel := range deletes {
+			if _, err := app.DB.RecordEvent(p.ID, rel, state.EventDelete, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, rel := range changed {
+		if _, err := app.DB.RecordEvent(p.ID, rel, state.EventModify, false); err != nil {
+			return err
+		}
+	}
+	if len(changed) > 500 || (len(manifest) > 0 && len(changed)*100 > len(manifest)*5) {
+		rt, err := app.DB.GetRuntime(p.ID)
+		if err != nil {
+			return err
+		}
+		return app.DB.PromoteToFullReconcile(p.ID, rt.SourceGeneration, state.Now())
+	}
+	_ = ctx
 	return nil
 }
 

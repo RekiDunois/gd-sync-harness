@@ -48,7 +48,7 @@ func asyncTestApp(t *testing.T) (*App, string) {
 	app := &App{
 		DB: db, Rclone: r,
 		Sync: sync.New(r, db), Reconciler: sync.NewReconciler(sync.New(r, db)),
-		Remote: remote.New(r, db), scheduler: newSyncScheduler(),
+		Remote: remote.New(r, db), LockDir: filepath.Join(t.TempDir(), "locks"), scheduler: newSyncScheduler(db),
 	}
 	return app, remoteRoot
 }
@@ -174,7 +174,11 @@ func TestTargetGenerationCannotExceed(t *testing.T) {
 	}
 
 	// Advance desired generation while the run is active.
-	if err := app.DB.RequestReconcile(p.ID); err != nil {
+	gen, err := app.DB.BumpGeneration(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.DB.EnsureReconcileGeneration(p.ID, gen); err != nil {
 		t.Fatal(err)
 	}
 	ss, _ := app.DB.GetSyncState(p.ID)
@@ -355,8 +359,8 @@ func TestExplicitSyncReopensEligibilityWithoutExecutingInCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	after, _ := app.DB.GetSyncState(p.ID)
-	if after.DesiredGeneration <= before.DesiredGeneration {
-		t.Fatal("sync request must advance desired generation")
+	if after.DesiredGeneration < before.DesiredGeneration {
+		t.Fatal("sync request must not lower desired generation")
 	}
 	if after.State == state.StateError {
 		t.Fatal("sync request must reopen the gate (no longer error-blocked)")
@@ -376,7 +380,11 @@ func TestWatcherDestructiveAdvancesDesired(t *testing.T) {
 	p := asyncTestProfile(t, app, "p8")
 
 	before, _ := app.DB.GetSyncState(p.ID)
-	if err := app.DB.RequestReconcile(p.ID); err != nil {
+	gen, err := app.DB.BumpGeneration(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.DB.EnsureReconcileGeneration(p.ID, gen); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := app.DB.GetSyncState(p.ID)

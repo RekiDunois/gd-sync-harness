@@ -79,6 +79,9 @@ func runSyncNow(app *App, p *state.Profile) error {
 		fmt.Printf("sync-now %s: up to date\n", p.ID)
 		return nil
 	}
+	if ss, _ := app.DB.GetSyncState(p.ID); ss != nil && ss.CurrentRunID != nil {
+		return fmt.Errorf("profile %q has an active full reconciliation; fast sync deferred", p.ID)
+	}
 
 	if err := app.upsertForProfile(ctx, p, files); err != nil {
 		_ = app.DB.SetLastError(p.ID, err.Error())
@@ -87,7 +90,13 @@ func runSyncNow(app *App, p *state.Profile) error {
 	if err := updateManifest(app.DB, p, scan, files); err != nil {
 		return err
 	}
-	if err := app.DB.ClearPendingPaths(p.ID, files); err != nil {
+	var snapshot []state.PendingEvent
+	for _, event := range pending {
+		if changedSet[event.Path] {
+			snapshot = append(snapshot, event)
+		}
+	}
+	if err := app.DB.ClearPendingEvents(p.ID, snapshot); err != nil {
 		return err
 	}
 	if err := app.DB.MarkFastSuccess(p.ID); err != nil {

@@ -32,11 +32,13 @@ type App struct {
 	RcloneBin  string
 	FSWatchBin string
 	LogDir     string
+	LockDir    string
 }
 
-// Context returns a root context with default timeout.
+// Context returns a cancellable lifecycle context. Long data-plane operations
+// must not inherit an arbitrary wall-clock deadline.
 func (a *App) Context() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 30*time.Minute)
+	return context.WithCancel(context.Background())
 }
 
 // NewApp initializes the shared app from the environment. Tool paths are read
@@ -85,7 +87,7 @@ func NewApp() (*App, error) {
 	return &App{
 		DB: db, Rclone: rclone, Remote: rm, Sync: svc, Reconciler: rec,
 		ConfigPath: configPath, RcloneBin: rcloneBin, FSWatchBin: fswatchBin,
-		LogDir: logDir, scheduler: newSyncScheduler(),
+		LogDir: logDir, LockDir: filepath.Join(mustStateDir(), "locks"), scheduler: newSyncScheduler(db),
 	}, nil
 }
 
@@ -128,14 +130,22 @@ func (a *App) requireProfile(id string) (*state.Profile, error) {
 
 // withProfileLock acquires the per-profile writer lock and releases on done.
 func (a *App) withProfileLock(p *state.Profile, fn func() error) error {
-	stateDir, _ := paths.StateDir()
-	lockDir := filepath.Join(stateDir, "locks")
+	lockDir := a.LockDir
+	if lockDir == "" {
+		stateDir, _ := paths.StateDir()
+		lockDir = filepath.Join(stateDir, "locks")
+	}
 	lock, err := flock.Acquire(lockDir, p.ID)
 	if err != nil {
 		return err
 	}
 	defer lock.Release()
 	return fn()
+}
+
+func mustStateDir() string {
+	d, _ := paths.StateDir()
+	return d
 }
 
 // logPathFor returns a per-profile log path.
@@ -149,7 +159,7 @@ func NewRootCmd() *cobra.Command {
 		Use:          "knowledge-sync",
 		Short:        "Local knowledge sources -> Google Drive via rclone",
 		SilenceUsage: true,
-		Version:      version.Version,
+		Version:      version.Details(),
 	}
 
 	root.AddCommand(

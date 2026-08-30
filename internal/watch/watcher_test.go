@@ -14,15 +14,14 @@ import (
 	"knowledge-sync/internal/state"
 )
 
-// fakeFSWatch writes a fake fswatch binary that emits NUL-separated paths then
-// sleeps. Emits the given absolute paths one per NUL record.
-func fakeFSWatch(t *testing.T, events []string) string {
+// fakeFSWatch writes numeric fswatch records: path NUL flags NUL.
+func fakeFSWatch(t *testing.T, events []string, flags uint64) string {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fswatch-fake")
 	script := "#!/bin/sh\n"
 	for _, e := range events {
-		script += fmt.Sprintf("printf '%s\\0'\n", strings.ReplaceAll(e, "'", "'\\''"))
+		script += fmt.Sprintf("printf '%%s\\0%%s\\0' '%s' '%d'\n", strings.ReplaceAll(e, "'", "'\\''"), flags)
 	}
 	script += "while true; do sleep 1; done\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
@@ -44,24 +43,30 @@ func openTestState(t *testing.T) *state.DB {
 func TestWatcherPersistsAndReconciles(t *testing.T) {
 	db := openTestState(t)
 	src := t.TempDir()
+	if err := db.CreateProfile(&state.Profile{ID: "p1", ProfileUUID: "u1", Type: "generic", SourcePath: src, RemoteName: "example-remote", RemoteFolderID: "f1", RemoteDisplayPath: "mirror", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE profile_sync_state SET initialized_at = '2026-01-01T00:00:00.000Z', last_success_generation = 1, desired_generation = 1, state = 'ready' WHERE profile_id = 'p1'`); err != nil {
+		t.Fatal(err)
+	}
 	// create a file that will be deleted
 	gone := filepath.Join(src, "gone.md")
 	if err := os.WriteFile(gone, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	fake := fakeFSWatch(t, []string{gone})
+	fake := fakeFSWatch(t, []string{gone}, EventUpdated|EventIsFile)
 	lg := log.New(io.Discard, "", 0)
 
 	batchCalled := make(chan []string, 1)
 	reconcileCalled := make(chan struct{}, 1)
 	w := &Watcher{
-		ProfileID:   "p1",
-		SourcePath:  src,
-		FSWatchBin:  fake,
-		DB:          db,
-		Log:         lg,
-		Settings:    FastSettings{SettleSeconds: 1, MaxDelaySeconds: 2},
+		ProfileID:  "p1",
+		SourcePath: src,
+		FSWatchBin: fake,
+		DB:         db,
+		Log:        lg,
+		Settings:   FastSettings{SettleSeconds: 5, MaxDelaySeconds: 10},
 		OnBatch: func(ctx context.Context, changed []string) error {
 			batchCalled <- changed
 			return nil
@@ -81,11 +86,24 @@ func TestWatcherPersistsAndReconciles(t *testing.T) {
 	// The fake emits gone.md which no longer exists at handleEvent time? It does
 	// exist here. So it becomes a modify event, not delete. Delete the file after
 	// start to make the persisted event a delete.
-	time.Sleep(300 * time.Millisecond)
+	deadline := time.After(10 * time.Second)
+	for {
+		pending, err := db.ListPending("p1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("event was not persisted")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 	if err := os.Remove(gone); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond)
 
 	// First event (before delete) is a modify on gone.md — but wait, the fake
 	// emits at start, before we delete. Actually the file existed then, so it's
@@ -112,11 +130,14 @@ func TestWatcherPersistsAndReconciles(t *testing.T) {
 func TestWatcherDeleteRequestsReconcile(t *testing.T) {
 	db := openTestState(t)
 	src := t.TempDir()
+	if err := db.CreateProfile(&state.Profile{ID: "p1", ProfileUUID: "u1", Type: "generic", SourcePath: src, RemoteName: "example-remote", RemoteFolderID: "f1", RemoteDisplayPath: "mirror", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	gone := filepath.Join(src, "gone.md")
 	_ = os.WriteFile(gone, []byte("x"), 0o644)
 
 	// fake emits the path AFTER we delete it, so classify() returns delete.
-	fake := fakeFSWatch(t, []string{gone})
+	fake := fakeFSWatch(t, []string{gone}, EventRemoved|EventIsFile)
 	_ = os.Remove(gone)
 
 	lg := log.New(io.Discard, "", 0)
@@ -145,15 +166,15 @@ func TestWatcherDeleteRequestsReconcile(t *testing.T) {
 	select {
 	case <-reconcileCalled:
 		// OnReconcile may be invoked via fireBatch when a delete is pending.
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("delete event did not trigger reconciliation request")
 	}
 
-	destructive, err := db.HasDestructivePending("p1")
+	ss, err := db.GetSyncState("p1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !destructive {
-		t.Error("expected destructive pending state after delete")
+	if !ss.HasDebt() {
+		t.Error("expected durable full debt after delete")
 	}
 }

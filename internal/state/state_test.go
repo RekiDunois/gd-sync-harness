@@ -106,6 +106,33 @@ func TestPendingEventsUpsert(t *testing.T) {
 	}
 }
 
+func TestEnsureReconcileGenerationIsMonotonic(t *testing.T) {
+	db := openTestDB(t)
+	p := &Profile{ID: "generation", ProfileUUID: "u-generation", Type: "generic",
+		SourcePath: "/src", RemoteName: "example-remote", RemoteFolderID: "f",
+		RemoteDisplayPath: "mirror", Enabled: true}
+	if err := db.CreateProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	gen, err := db.BumpGeneration(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureReconcileGeneration(p.ID, gen); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnsureReconcileGeneration(p.ID, gen-1); err != nil {
+		t.Fatal(err)
+	}
+	s, err := db.GetSyncState(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.DesiredGeneration != gen {
+		t.Fatalf("desired generation = %d, want %d", s.DesiredGeneration, gen)
+	}
+}
+
 func TestManifestReplace(t *testing.T) {
 	db := openTestDB(t)
 	entries := []ManifestEntry{

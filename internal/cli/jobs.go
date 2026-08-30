@@ -67,10 +67,7 @@ func mustSelfPath() string {
 func installJobs(app *App, p *state.Profile) error {
 	agentsDir, _ := paths.LaunchAgentsDir()
 	for _, cfg := range jobConfigs(app, p) {
-		if _, err := cfg.Install(agentsDir); err != nil {
-			return err
-		}
-		if err := cfg.Load(agentsDir); err != nil {
+		if err := cfg.Reload(agentsDir); err != nil {
 			return fmt.Errorf("load %s: %w", cfg.Label(), err)
 		}
 	}
@@ -112,10 +109,7 @@ func stopJobs(app *App, profileID string) error {
 func installWorkerJob(app *App) error {
 	agentsDir, _ := paths.LaunchAgentsDir()
 	cfg := workerConfig(app)
-	if _, err := cfg.Install(agentsDir); err != nil {
-		return err
-	}
-	if err := cfg.Load(agentsDir); err != nil {
+	if err := cfg.Reload(agentsDir); err != nil {
 		return fmt.Errorf("load %s: %w", cfg.Label(), err)
 	}
 	return nil

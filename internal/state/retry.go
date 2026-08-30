@@ -7,8 +7,9 @@ import (
 
 // Retry classification values.
 const (
-	RetryRetryable = "retryable"
-	RetryTerminal  = "terminal"
+	RetryRetryable        = "retryable"
+	RetryRetryableLimited = "retryable_limited"
+	RetryTerminal         = "terminal"
 )
 
 // RetryBackoff computes the next retry delay for the given consecutive failure
@@ -30,4 +31,16 @@ func RetryBackoff(consecutive int) time.Duration {
 	// 20% jitter.
 	delay += time.Duration(rand.Int63n(int64(delay) / 5))
 	return delay
+}
+
+// LimitedRetryBackoff is the fixed schedule for unclassified failures.
+func LimitedRetryBackoff(failure int) time.Duration {
+	switch failure {
+	case 1:
+		return time.Minute
+	case 2:
+		return 5 * time.Minute
+	default:
+		return 15 * time.Minute
+	}
 }

@@ -192,6 +192,34 @@ func migrate(db *sql.DB) error {
 		WHERE last_success_generation IS NULL
 			AND desired_generation = 0;
 		`,
+		// v6: structured rclone progress and durable destructive debounce.
+		// These are additive so existing profile, manifest, pending, and run
+		// history remain intact during an in-place upgrade.
+		`
+		ALTER TABLE profile_sync_state ADD COLUMN last_heartbeat_at TEXT;
+		ALTER TABLE profile_sync_state ADD COLUMN reconcile_not_before_at TEXT;
+		ALTER TABLE profile_sync_state ADD COLUMN reconcile_deadline_at TEXT;
+		ALTER TABLE profile_sync_state ADD COLUMN limited_failures INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN last_heartbeat_at TEXT;
+		ALTER TABLE sync_runs ADD COLUMN checks_completed INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN checks_total INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN items_listed INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN errors_count INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN speed_bytes_per_second REAL NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN current_item TEXT;
+		ALTER TABLE sync_runs ADD COLUMN current_item_bytes INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sync_runs ADD COLUMN current_item_size INTEGER NOT NULL DEFAULT 0;
+		CREATE TABLE remote_operation_leases (
+			id TEXT PRIMARY KEY,
+			remote_name TEXT NOT NULL,
+			priority INTEGER NOT NULL,
+			owner_pid INTEGER NOT NULL,
+			state TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			lease_until TEXT NOT NULL
+		);
+		CREATE INDEX idx_remote_leases ON remote_operation_leases(remote_name, state, priority, created_at);
+		`,
 	}
 
 	for i, m := range migrations {
