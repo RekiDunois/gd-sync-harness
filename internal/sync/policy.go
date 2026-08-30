@@ -16,22 +16,47 @@ type PolicyScanResult struct {
 	ActivePaths []string
 }
 
-// ScanActivePaths walks the profile source with the committed policy matcher
-// (directory-aware), applying the non-path eligibility rules (symlink, size)
-// and returning the active relative paths (§8.1, §10.2). The profile's legacy
+// ActiveEntry is one eligible local file discovered by a metadata-aware active
+// scan under the committed policy. It carries the high-resolution size and
+// mtime so a same-path change can be detected by the source-stability
+// fingerprint without a content hash (§9 of the ignored-churn fix plan).
+type ActiveEntry struct {
+	RelPath   string
+	Size      int64
+	ModTimeNS int64
+}
+
+// ScanActiveEntries walks the profile source with the committed policy matcher
+// (directory-aware), applying the non-path eligibility rules (symlink, size),
+// and returns the active entries with metadata (§9.1). The profile's legacy
 // Excludes field is not used: committed policy is the sole path authority.
-func ScanActivePaths(sourcePath string, maxFileSize int64, snap *policy.Snapshot) ([]string, error) {
+func ScanActiveEntries(sourcePath string, maxFileSize int64, snap *policy.Snapshot) ([]ActiveEntry, error) {
 	eng := filter.FromPolicy("", maxFileSize, snap)
-	var out []string
-	err := walkDirActive(sourcePath, "", eng, &out)
+	var out []ActiveEntry
+	err := walkDirActiveEntries(sourcePath, "", eng, &out)
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].RelPath < out[j].RelPath })
 	return out, nil
 }
 
-func walkDirActive(sourcePath, rel string, eng *filter.Engine, out *[]string) error {
+// ScanActivePaths is the path-only projection of ScanActiveEntries. It shares
+// the same eligibility traversal so rclone --files-from, manifest active sets,
+// and preflight fingerprints never drift from each other (§9.2).
+func ScanActivePaths(sourcePath string, maxFileSize int64, snap *policy.Snapshot) ([]string, error) {
+	entries, err := ScanActiveEntries(sourcePath, maxFileSize, snap)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for i := range entries {
+		paths = append(paths, entries[i].RelPath)
+	}
+	return paths, nil
+}
+
+func walkDirActiveEntries(sourcePath, rel string, eng *filter.Engine, out *[]ActiveEntry) error {
 	dir := sourcePath
 	if rel != "" {
 		dir = filepath.Join(sourcePath, rel)
@@ -50,7 +75,7 @@ func walkDirActive(sourcePath, rel string, eng *filter.Engine, out *[]string) er
 			if excluded, _ := eng.ExcludedDir(childRel, true); excluded {
 				continue
 			}
-			if err := walkDirActive(sourcePath, childRel, eng, out); err != nil {
+			if err := walkDirActiveEntries(sourcePath, childRel, eng, out); err != nil {
 				return err
 			}
 			continue
@@ -69,7 +94,11 @@ func walkDirActive(sourcePath, rel string, eng *filter.Engine, out *[]string) er
 		if eng.OverSize(fi.Size()) {
 			continue
 		}
-		*out = append(*out, childRel)
+		*out = append(*out, ActiveEntry{
+			RelPath:   childRel,
+			Size:      fi.Size(),
+			ModTimeNS: fi.ModTime().UnixNano(),
+		})
 	}
 	return nil
 }

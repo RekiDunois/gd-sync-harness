@@ -84,11 +84,11 @@ func (r *Reconciler) reconcileProtected(ctx context.Context, p *state.Profile, s
 // PreflightProtected performs the dry-run against a stable source generation
 // under the owned policy snapshot.
 func (r *Reconciler) PreflightProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, options SyncOptions) (*PreflightResult, error) {
-	active1, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
+	active1, err := ScanActiveEntries(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return nil, err
 	}
-	fp1 := fingerprintPaths(active1)
+	fp1 := fingerprintActiveEntries(active1)
 
 	dry, err := r.Service.DryRunSyncProtected(ctx, p, snap, options)
 	if err != nil {
@@ -97,29 +97,41 @@ func (r *Reconciler) PreflightProtected(ctx context.Context, p *state.Profile, s
 	dry.SourceFiles = len(active1)
 	dry.SourceFingerprint = fp1
 
-	active2, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
+	active2, err := ScanActiveEntries(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return nil, err
 	}
-	dry.SourceStable = fp1 == fingerprintPaths(active2)
+	dry.SourceStable = fp1 == fingerprintActiveEntries(active2)
 	return dry, nil
 }
 
-// fingerprintPaths is a stable, order-independent fingerprint of a path set.
-func fingerprintPaths(paths []string) string {
-	sorted := append([]string(nil), paths...)
-	sort.Strings(sorted)
-	return strings.Join(sorted, "\x00")
+// fingerprintActiveEntries is a stable, order-independent fingerprint of the
+// active entries including high-resolution size and mtime (§9.3). A same-path
+// content change that preserves the path (size or mtime) is detected without a
+// content hash. Ignored churn never appears in the entry set, so it cannot
+// destabilize the fingerprint.
+func fingerprintActiveEntries(entries []ActiveEntry) string {
+	if len(entries) == 0 {
+		return "empty"
+	}
+	sorted := append([]ActiveEntry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].RelPath < sorted[j].RelPath })
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%d:", len(sorted))
+	for _, e := range sorted {
+		fmt.Fprintf(&sb, "%s:%d:%d;", e.RelPath, e.Size, e.ModTimeNS)
+	}
+	return sb.String()
 }
 
 // markDirtyIfChangedProtected re-scans after the live sync and advances desired
 // reconciliation intent if the source changed during sync (§15.1.7).
 func (r *Reconciler) markDirtyIfChangedProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, pre *PreflightResult) error {
-	active, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
+	active, err := ScanActiveEntries(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return err
 	}
-	if fingerprintPaths(active) != pre.SourceFingerprint {
+	if fingerprintActiveEntries(active) != pre.SourceFingerprint {
 		gen, err := r.Service.DB.BumpGeneration(p.ID)
 		if err != nil {
 			return err
