@@ -14,6 +14,13 @@ const (
 	EventOther  = "other"
 )
 
+// IsSafeFastKind reports whether an event kind is safe for targeted fast
+// processing (create/modify). Destructive or uncertain kinds (delete, rename,
+// other, or unknown) must fail closed to a full reconcile (§6.1).
+func IsSafeFastKind(kind string) bool {
+	return kind == EventCreate || kind == EventModify
+}
+
 // PendingEvent is one queued file change.
 type PendingEvent struct {
 	ID               int64  `json:"id"`
@@ -109,7 +116,15 @@ func (d *DB) recordEvent(profileID, path, kind string, full bool, policyHash str
 	if policyKnown {
 		knownArg = 1
 	}
-	if full || !last.Valid || desired > last.Int64 || current.Valid {
+	// Event-kind aware decision. Safe create/modify events stay in the fast
+	// lane: they advance source_generation and keep durable path evidence but
+	// never promote to full-reconcile debt merely because a run is active or
+	// older full debt exists. Destructive/uncertain events (and the bootstrap
+	// fallback) fail closed to a full reconcile, collapsing prior pending
+	// evidence (§6 of the ignored-churn fix plan).
+	safe := IsSafeFastKind(kind)
+	bootstrapNeedsFull := !last.Valid && desired == 0 && !current.Valid
+	if full || !safe || bootstrapNeedsFull {
 		now := Now()
 		notBefore := now.Add(10 * time.Second).Format(timeFmt)
 		deadline := now.Add(60 * time.Second).Format(timeFmt)
