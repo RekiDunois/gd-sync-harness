@@ -281,6 +281,14 @@ func (w *Watcher) fireBatch(ctx context.Context, window map[string]struct{}) err
 			batch = append(batch, event)
 		}
 	}
+	// The watcher is an event producer only (§13.1): execution decisions
+	// (full-vs-fast, debounce evaluation, event clearing) belong to the worker.
+	// The durable pending_events rows carry first_seen/last_seen for the
+	// worker's due-batch evaluation; a restart never changes eligibility.
+	//
+	// We still notify the worker so the full/fast decision happens promptly.
+	// Destructive/uncertain events promote to full reconciliation as before —
+	// this is a durable intent decision, not an execution.
 	full, err := w.DB.HasDestructivePending(w.ProfileID)
 	if err != nil {
 		return err
@@ -302,29 +310,33 @@ func (w *Watcher) fireBatch(ctx context.Context, window map[string]struct{}) err
 		}
 		return nil
 	}
-	ss, _ := w.DB.GetSyncState(w.ProfileID)
-	if ss != nil && ss.HasDebt() && len(batch) == 0 {
-		if w.OnReconcile != nil {
-			return w.OnReconcile(ctx)
+	if len(batch) == 0 {
+		// No fast-path batch, but durable full-debt may exist (e.g. a
+		// destructive event promoted directly to a full reconcile). Notify the
+		// worker so it schedules the full reconcile promptly.
+		ss, _ := w.DB.GetSyncState(w.ProfileID)
+		if ss != nil && ss.HasDebt() {
+			if w.OnReconcile != nil {
+				return w.OnReconcile(ctx)
+			}
+			return nil
 		}
 		return nil
 	}
-	if len(batch) == 0 {
-		return nil
-	}
-	changed := make([]string, 0, len(batch))
-	for _, event := range batch {
-		changed = append(changed, event.Path)
-	}
 	if w.OnBatch != nil {
-		if err := w.OnBatch(ctx, changed); err != nil {
+		if err := w.OnBatch(ctx, batchPaths(batch)); err != nil {
 			return err
 		}
 	}
-	if err := w.DB.ClearPendingEvents(w.ProfileID, batch); err != nil {
-		return err
+	return nil
+}
+
+func batchPaths(batch []state.PendingEvent) []string {
+	out := make([]string, 0, len(batch))
+	for _, e := range batch {
+		out = append(out, e.Path)
 	}
-	return w.DB.MarkFastSuccess(w.ProfileID)
+	return out
 }
 
 func splitNUL(data []byte, atEOF bool) (advance int, token []byte, err error) {

@@ -48,7 +48,7 @@ func asyncTestApp(t *testing.T) (*App, string) {
 	app := &App{
 		DB: db, Rclone: r,
 		Sync: sync.New(r, db), Reconciler: sync.NewReconciler(sync.New(r, db)),
-		Remote: remote.New(r, db), LockDir: filepath.Join(t.TempDir(), "locks"), scheduler: newSyncScheduler(db),
+		Remote: remote.New(r, db), LockDir: filepath.Join(t.TempDir(), "locks"),
 	}
 	return app, remoteRoot
 }

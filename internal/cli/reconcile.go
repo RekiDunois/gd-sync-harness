@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
-	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"knowledge-sync/internal/live"
 	"knowledge-sync/internal/state"
 	"knowledge-sync/internal/sync"
 )
@@ -13,7 +15,7 @@ import (
 func newReconcileScheduledCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "reconcile-scheduled <profile>",
-		Short: "Run the hourly safety reconciliation for a profile (launchd entrypoint)",
+		Short: "Request the hourly safety reconciliation for a profile (launchd entrypoint)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, err := NewApp()
@@ -25,9 +27,15 @@ func newReconcileScheduledCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return app.withProfileLock(p, func() error {
-				return runReconcile(app, p, sync.SyncOptions{}, true)
-			})
+			// Persist durable scheduled intent, wake the worker, and exit
+			// without waiting for transfer completion (§12.1).
+			gen, err := app.DB.SubmitScheduledReconcile(p.ID)
+			if err != nil {
+				return err
+			}
+			wakeWorker(app, p.ID)
+			fmt.Printf("reconciliation scheduled for %s (generation %d); the worker owns execution\n", p.ID, gen)
+			return nil
 		},
 	}
 }
@@ -36,7 +44,7 @@ func newReconcileNowCmd() *cobra.Command {
 	var allowDeletes int
 	c := &cobra.Command{
 		Use:   "reconcile-now <profile>",
-		Short: "Run full authoritative reconciliation with preflight + delete budget",
+		Short: "Run full authoritative reconciliation with preflight + delete budget (worker-owned)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, err := NewApp()
@@ -48,109 +56,140 @@ func newReconcileNowCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return app.withProfileLock(p, func() error {
-				return runReconcile(app, p, sync.SyncOptions{AllowDeletes: allowDeletes}, false)
+			if p.DeletionRequestedAt != nil {
+				return fmt.Errorf("profile %q is being deleted; reconcile-now rejected", p.ID)
+			}
+			// Submit the durable one-attempt manual intent and wait for the
+			// submitted generation in the worker (§12.1, §14.4).
+			gen, err := app.DB.SubmitManualReconcile(p.ID, state.ManualReconcileIntent{
+				AllowDeletes: allowDeletes, BypassDebounce: true,
 			})
+			if err != nil {
+				return err
+			}
+			backupNow(app)
+			wakeWorker(app, p.ID)
+			if err := waitForGeneration(app, p.ID, gen); err != nil {
+				return fmt.Errorf("reconciliation for %q did not reach generation %d: %w", p.ID, gen, err)
+			}
+			fmt.Printf("reconcile %s: complete (generation %d)\n", p.ID, gen)
+			return nil
 		},
 	}
 	c.Flags().IntVar(&allowDeletes, "allow-deletes", 0, "one-shot delete budget override (§16)")
 	return c
 }
 
-func runReconcile(app *App, p *state.Profile, options sync.SyncOptions, scheduled bool) error {
-	// CLI entrypoints (reconcile-now, reconcile-scheduled, sync, migrate) and
-	// watch-triggered reconciles route through the same worker-owned claim and
-	// execution path. This never runs a competing transfer inside the CLI: it
-	// either claims the durable attempt or observes an existing one.
-	//
-	// force=true keeps the pre-existing safety-net semantics: the hourly
-	// scheduled reconcile and explicit reconcile-now run a full reconciliation
-	// even with no known debt (to catch remote drift), while the event-driven
-	// worker pass remains strictly debt-driven.
-	// Scheduled reconciliation must respect the durable destructive debounce;
-	// explicit reconcile-now is allowed to bypass it. Both retain the safety-net
-	// behavior of running even when no generation debt is known.
-	ctx, cancel := app.Context()
-	defer cancel()
-	lease := leaseID()
-	if err := app.DB.AcquireRemoteLease(ctx, p.RemoteName, 1, 2, os.Getpid(), lease); err != nil {
-		return err
-	}
-	stopRenewal := startLeaseRenewal(ctx, app.DB, lease)
-	defer stopRenewal()
-	defer app.DB.ReleaseRemoteLease(lease)
-	force := true
-	run, res, err := app.DB.ClaimRunWithOptions(p.ID, newRunID(), force, !scheduled)
+// runReconcile is the shared control-plane entrypoint used by sync-now upgrade
+// paths and profile migration (§7, §12.1). It persists durable intent, wakes
+// the worker, and (when wait is true) waits for the submitted generation. It
+// never executes a competing transfer inside the CLI process.
+func runReconcile(app *App, p *state.Profile, options sync.SyncOptions, wait bool) error {
+	intent := state.ManualReconcileIntent{AllowDeletes: options.AllowDeletes, BypassDebounce: true}
+	gen, err := app.DB.SubmitManualReconcile(p.ID, intent)
 	if err != nil {
 		return err
 	}
-	switch res {
-	case state.ClaimOK:
-		return executeReconcileAttempt(app, p, run, options, scheduled, nil)
-	case state.ClaimActiveRun:
-		// An active run already owns the profile; request a newer desired
-		// generation so a follow-up reconciliation is eligible (§18.4).
-		_ = app.DB.RequestReconcile(p.ID)
-		return fmt.Errorf("reconciliation already running for %q; follow-up generation requested", p.ID)
-	case state.ClaimGateBlocked:
-		// A terminal/retry gate blocks automatic claims. Only explicit manual
-		// requests (reconcile-now) reopen eligibility; scheduled safety-net
-		// runs and watch-triggered destructive reconciles respect the gate
-		// because ordinary filesystem events must not clear terminal errors
-		// (§18.4, §20).
-		if scheduled {
-			return fmt.Errorf("reconciliation for %q is gated (%s); run 'knowledge-sync sync %s' to reopen eligibility",
-				p.ID, gateReason(app, p.ID), p.ID)
+	wakeWorker(app, p.ID)
+	if !wait {
+		return nil
+	}
+	if err := waitForGeneration(app, p.ID, gen); err != nil {
+		return fmt.Errorf("reconciliation for %q did not reach generation %d: %w", p.ID, gen, err)
+	}
+	return nil
+}
+
+// wakeWorker sends a best-effort invalidation/wake message so the worker
+// reschedules promptly. Durable SQLite intent remains authoritative; the 5s
+// worker rescan is the correctness fallback (§5.4, §15.2).
+func wakeWorker(app *App, profileID string) {
+	configured, _ := app.DB.GetSetting(state.SettingWorkerSocketPath)
+	path := live.ResolveSocketPath(configured)
+	live.SendInvalidate(path, profileID)
+}
+
+// waitForGeneration observes until last_success_generation >= minimum or a
+// blocking lifecycle/terminal condition (§14.3, §14.4). It is socket-first with
+// SQLite fallback and never cancels the worker.
+func waitForGeneration(app *App, profileID string, minimum int64) error {
+	obs := socketObserver(app, profileID)
+	deadline := time.Now().Add(24 * time.Hour)
+	for {
+		stream, err := obs.Connect()
+		if err == nil {
+			ok, done := waitStreamGeneration(stream, profileID, minimum)
+			stream.Close()
+			if done {
+				if ok {
+					return nil
+				}
+				return fmt.Errorf("wait terminated before generation %d was reached", minimum)
+			}
+			time.Sleep(waiterPollInterval)
+			continue
 		}
-		if err := app.DB.ReopenSyncGate(p.ID); err != nil {
-			return err
-		}
-		run, res, err = app.DB.ClaimRunMode(p.ID, newRunID(), force)
+		// SQLite fallback.
+		ok, done, err := durableGenerationReached(app, profileID, minimum)
 		if err != nil {
 			return err
 		}
-		if res == state.ClaimOK {
-			return executeReconcileAttempt(app, p, run, options, scheduled, nil)
+		if done {
+			if ok {
+				return nil
+			}
+			return fmt.Errorf("wait terminated before generation %d was reached", minimum)
 		}
-		return fmt.Errorf("reconciliation gate re-opened but claim rejected")
-	case state.ClaimNoDebt:
-		if !scheduled {
-			fmt.Printf("reconcile %s: nothing to reconcile\n", p.ID)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for generation %d", minimum)
 		}
-		return nil
-	case state.ClaimDeferred:
-		return nil
-	case state.ClaimProfileInactive:
-		return fmt.Errorf("profile %q is not eligible for reconciliation (disabled, tombstoned, or deleting)", p.ID)
+		time.Sleep(waiterPollInterval)
 	}
-	return fmt.Errorf("unexpected claim result")
 }
 
-func gateReason(app *App, id string) string {
-	ss, err := app.DB.GetSyncState(id)
-	if err != nil || ss.RetryClassification == nil {
-		return "gate blocked"
+// waitStreamGeneration consumes snapshots until generation success or terminal.
+// Returns (ok, done).
+func waitStreamGeneration(stream *live.Stream, profileID string, minimum int64) (bool, bool) {
+	for {
+		snap, err := stream.Next()
+		if err != nil {
+			return false, false // reconnect/fallback
+		}
+		if snap.ProfileID != profileID {
+			continue
+		}
+		if snap.Sync.LastSuccessGeneration != nil && *snap.Sync.LastSuccessGeneration >= minimum {
+			return true, true
+		}
+		done, err := terminalFromSnapshot(snap)
+		if err != nil {
+			return false, true
+		}
+		if done {
+			// Ready for an older generation is not success for this waiter.
+			return false, false
+		}
 	}
-	return *ss.RetryClassification
 }
 
-func effectiveMaxDelete(p *state.Profile, o sync.SyncOptions) int {
-	if o.AllowDeletes > 0 {
-		return o.AllowDeletes
-	}
-	return p.MaxDelete
-}
-
-func refreshManifest(db *state.DB, p *state.Profile, pre *sync.PreflightResult) error {
-	scan, err := sync.ScanLocal(p)
+// durableGenerationReached is the SQLite fallback generation check.
+func durableGenerationReached(app *App, profileID string, minimum int64) (bool, bool, error) {
+	ss, err := app.DB.GetSyncState(profileID)
 	if err != nil {
-		return err
+		if errors.Is(err, state.ErrNotFound) {
+			return false, true, fmt.Errorf("profile %q is no longer present (deleted)", profileID)
+		}
+		return false, true, err
 	}
-	entries := make([]state.ManifestEntry, 0, len(scan.Entries))
-	for _, e := range scan.Entries {
-		entries = append(entries, state.ManifestEntry{
-			ProfileID: p.ID, RelPath: e.RelPath, Size: e.Size, ModTime: e.ModTime,
-		})
+	if ss.LastSuccessGeneration != nil && *ss.LastSuccessGeneration >= minimum {
+		return true, true, nil
 	}
-	return db.ManifestReplaceAll(p.ID, entries)
+	// Terminal conditions terminate the wait even if the generation was not
+	// reached.
+	if ss.State == state.StateError {
+		if ss.RetryClassification != nil && *ss.RetryClassification == state.RetryTerminal {
+			return false, true, fmt.Errorf("profile %q blocked by terminal error: %s", profileID, stringOr(ss.LastError, "unknown"))
+		}
+	}
+	return false, false, nil
 }

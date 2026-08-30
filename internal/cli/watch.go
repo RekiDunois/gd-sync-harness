@@ -58,27 +58,20 @@ func runWatcher(app *App, p *state.Profile) error {
 		Log:        lg,
 		Settings:   watch.DefaultFastSettings(),
 		Filter:     filter.FromProfile(p),
+		// The watcher is an event/intent producer only (§13.1): it records
+		// durable events and wakes the worker, which owns fast-upsert
+		// execution. The debounce deadline is evaluated by the worker from
+		// durable first_seen/last_seen timestamps.
 		OnBatch: func(ctx context.Context, changed []string) error {
-			return app.withProfileLock(p, func() error {
-				ss, _ := app.DB.GetSyncState(p.ID)
-				if ss != nil && ss.HasDebt() {
-					return nil
-				}
-				var eligible []string
-				for _, rel := range changed {
-					if _, err := os.Stat(joinSource(p.SourcePath, rel)); err == nil {
-						eligible = append(eligible, rel)
+			for _, rel := range changed {
+				if _, err := os.Stat(joinSource(p.SourcePath, rel)); err == nil {
+					if _, err := app.DB.RecordEvent(p.ID, rel, state.EventModify, false); err != nil {
+						return err
 					}
 				}
-				if len(eligible) == 0 {
-					return nil
-				}
-				if err := app.upsertForProfile(ctx, p, eligible); err != nil {
-					lg.Printf("fast upsert failed: %v", err)
-					return err
-				}
-				return app.DB.MarkFastSuccess(p.ID)
-			})
+			}
+			wakeWorker(app, p.ID)
+			return nil
 		},
 		OnReconcile: func(ctx context.Context) error {
 			rt, err := app.DB.GetRuntime(p.ID)
@@ -86,7 +79,9 @@ func runWatcher(app *App, p *state.Profile) error {
 				return err
 			}
 			lg.Printf("destructive event: durable full reconciliation scheduled")
-			return app.DB.ScheduleDestructiveReconcile(p.ID, rt.SourceGeneration, state.Now())
+			err = app.DB.ScheduleDestructiveReconcile(p.ID, rt.SourceGeneration, state.Now())
+			wakeWorker(app, p.ID)
+			return err
 		},
 		OnCatchUp: func(ctx context.Context) error { return runWatcherCatchUp(ctx, app, p) },
 	}

@@ -80,6 +80,12 @@ func profileAddCmd() *cobra.Command {
 				fmt.Println("  dry-run:  no remote root, sidecar, or database row created")
 				return nil
 			}
+			// An enabled profile requires the global worker job (§15.1).
+			if p.Enabled {
+				if err := ensureWorkerJob(app); err != nil {
+					return fmt.Errorf("ensure worker job: %w", err)
+				}
+			}
 			fmt.Println("Initial sync queued.")
 			fmt.Println()
 			fmt.Println("Check progress:")
@@ -236,6 +242,10 @@ func profileEnableCmd() *cobra.Command {
 				}
 				if err := startJobs(app, p); err != nil {
 					return err
+				}
+				// An enabled profile requires the global worker job (§15.1).
+				if err := ensureWorkerJob(app); err != nil {
+					return fmt.Errorf("ensure worker job: %w", err)
 				}
 				backupNow(app)
 				return nil
@@ -471,7 +481,7 @@ func runMigrate(app *App, p *state.Profile, newRemote, newPath string) error {
 
 	// 10. one successful sync/reconcile against new destination (§22.10).
 	// Reuse runReconcile so ownership validation runs against the new binding.
-	if err := runReconcile(app, &newP, sync.SyncOptions{}, false); err != nil {
+	if err := runReconcile(app, &newP, sync.SyncOptions{}, true); err != nil {
 		return fmt.Errorf("post-migration reconcile: %w", err)
 	}
 

@@ -4,12 +4,14 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"knowledge-sync/internal/state"
 )
 
 // newSyncCmd implements §18: the explicit control-plane request to reconcile
-// now. It changes durable eligibility (reopens terminal/retry gates) and asks
-// the worker to run the attempt; it never executes a competing transfer inside
-// the CLI process.
+// now. It submits durable manual intent (which reopens terminal/retry gates and
+// bypasses the destructive debounce for a one-attempt opportunity) and wakes the
+// worker; it never executes a competing transfer inside the CLI process.
 func newSyncCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "sync <profile>",
@@ -28,14 +30,13 @@ func newSyncCmd() *cobra.Command {
 			if p.DeletionRequestedAt != nil {
 				return fmt.Errorf("profile %q is being deleted; sync request rejected (§18.4)", p.ID)
 			}
-			// Reopen eligibility (clears terminal/retry gates) and advance
-			// durable reconciliation intent.
-			if err := app.DB.ReopenSyncGate(p.ID); err != nil {
+			// Submit durable manual intent and wake the worker.
+			if _, err := app.DB.SubmitManualReconcile(p.ID, state.ManualReconcileIntent{
+				BypassDebounce: true,
+			}); err != nil {
 				return err
 			}
-			if err := app.DB.RequestReconcile(p.ID); err != nil {
-				return err
-			}
+			wakeWorker(app, p.ID)
 			backupNow(app)
 			fmt.Printf("Reconciliation requested for %q.\n", p.ID)
 			fmt.Printf("The worker owns execution; check progress with:\n")
