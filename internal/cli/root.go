@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"knowledge-sync/internal/config"
 	rcexec "knowledge-sync/internal/exec"
 	"knowledge-sync/internal/flock"
+	"knowledge-sync/internal/live"
 	"knowledge-sync/internal/logger"
 	"knowledge-sync/internal/paths"
 	"knowledge-sync/internal/remote"
@@ -27,7 +30,17 @@ type App struct {
 	Remote     *remote.Manager
 	Sync       *sync.Service
 	Reconciler *sync.Reconciler
-	scheduler  *syncScheduler
+
+	// LiveReader is the durable-state cache backing the worker status socket
+	// (§6.1). It is created for every command but only the worker's server
+	// consumes it; observers use the live client package.
+	LiveReader *liveDurableReader
+
+	// LiveServer is the worker's Unix socket status server. It is nil for
+	// non-worker commands and when socket startup failed.
+	LiveServer *live.Server
+	// Activities holds the worker's ephemeral live activity state.
+	Activities *activityTracker
 
 	ConfigPath string
 	RcloneBin  string
@@ -98,8 +111,9 @@ func NewApp() (*App, error) {
 
 	return &App{
 		DB: db, Rclone: rclone, Remote: rm, Sync: svc, Reconciler: rec,
+		LiveReader: newLiveDurableReader(db), Activities: newActivityTracker(),
 		ConfigPath: configPath, RcloneBin: rcloneBin, FSWatchBin: fswatchBin,
-		LogDir: logDir, LockDir: filepath.Join(mustStateDir(), "locks"), scheduler: newSyncScheduler(db), Config: appConfig,
+		LogDir: logDir, LockDir: filepath.Join(mustStateDir(), "locks"), Config: appConfig,
 	}, nil
 }
 
@@ -126,6 +140,37 @@ func (a *App) Close() {
 	if a.DB != nil {
 		_ = a.DB.Close()
 	}
+}
+
+// activities returns the live activity tracker, creating one lazily so command
+// paths (including tests that build App structs directly) always have a valid
+// tracker.
+func (a *App) activities() *activityTracker {
+	if a.Activities == nil {
+		a.Activities = newActivityTracker()
+	}
+	return a.Activities
+}
+
+// liveReader returns the durable live reader, creating one lazily. Worker and
+// observer command paths both rely on it.
+func (a *App) liveReader() *liveDurableReader {
+	if a.LiveReader == nil {
+		a.LiveReader = newLiveDurableReader(a.DB)
+	}
+	return a.LiveReader
+}
+
+// outputWriter is the destination for status/observer rendering. Commands write
+// to it so tests can capture output without spawning processes.
+var outputWriter io.Writer = os.Stdout
+
+// out returns the current output writer.
+func out() io.Writer {
+	if outputWriter == nil {
+		return os.Stdout
+	}
+	return outputWriter
 }
 
 // requireProfile loads a non-tombstoned profile by ID.
@@ -191,6 +236,7 @@ func NewRootCmd() *cobra.Command {
 		newPurgeRemoteCmd(),
 		newProbeCmd(),
 		newStopCmd(),
+		newConfigCmd(),
 	)
 
 	return root

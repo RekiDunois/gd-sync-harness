@@ -86,3 +86,38 @@ func TestNewRcloneHasNoWallClockTimeout(t *testing.T) {
 		t.Fatalf("default timeout = %s, want uncapped", got)
 	}
 }
+
+func TestRunProgressUsesOneSecondStatsCadence(t *testing.T) {
+	dir := t.TempDir()
+	// Capture the arguments via a fake binary that logs them.
+	bin2 := filepath.Join(dir, "args-capture")
+	capture := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + filepath.Join(dir, "args.txt") + "\"\nexit 0\n"
+	if err := os.WriteFile(bin2, []byte(capture), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res := (&Rclone{Binary: bin2}).RunProgress(context.Background(), nil, "sync", "src:", "dst:")
+	if res.Err != nil {
+		t.Fatalf("run: %v", res.Err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "args.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := string(b)
+	if !strings.Contains(joined, "--stats") {
+		t.Fatalf("no --stats flag in args: %q", joined)
+	}
+	lines := strings.Fields(joined)
+	for i, line := range lines {
+		if line == "--stats" {
+			if i+1 >= len(lines) {
+				t.Fatal("--stats flag has no value")
+			}
+			if lines[i+1] != "1s" {
+				t.Fatalf("stats interval = %q, want 1s", lines[i+1])
+			}
+			return
+		}
+	}
+	t.Fatalf("--stats flag value not found: %q", joined)
+}

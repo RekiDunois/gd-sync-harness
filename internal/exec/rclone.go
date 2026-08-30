@@ -50,6 +50,9 @@ func (r *Rclone) Run(ctx context.Context, args ...string) Result {
 
 // ProgressStats is a best-effort snapshot of rclone's structured stats output.
 // The *Known fields distinguish an unavailable metric from a measured zero.
+// Speed is rclone's cumulative average over the invocation; it is not a current
+// transfer rate and must not be surfaced as live speed (§8.2). Live speed comes
+// from the worker's two-sample ThroughputEstimator over the Bytes counter.
 type ProgressStats struct {
 	Bytes, TotalBytes                           int64
 	Checks, TotalChecks                         int64
@@ -89,7 +92,7 @@ func (s ProgressStats) MeasurableProgress(previous *ProgressStats) bool {
 // JSON log lines remain in stderr; only records containing a structured stats
 // object reach onStats.
 func (r *Rclone) RunProgress(ctx context.Context, onStats func(ProgressStats), args ...string) Result {
-	flags := []string{"--use-json-log", "--stats", "10s", "--stats-log-level", "NOTICE"}
+	flags := []string{"--use-json-log", "--stats", "1s", "--stats-log-level", "NOTICE"}
 	full := r.baseArgs(append(flags, args...)...)
 	return r.runProgress(ctx, full, onStats)
 }
