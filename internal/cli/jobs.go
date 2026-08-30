@@ -115,6 +115,13 @@ func installWorkerJob(app *App) error {
 	return nil
 }
 
+// ensureWorkerJob installs the global worker job when an enabled profile is
+// being created or enabled (§15.1). It is idempotent: Reload on an already
+// installed job is a no-op re-load.
+func ensureWorkerJob(app *App) error {
+	return installWorkerJob(app)
+}
+
 // uninstallWorkerJob removes the global worker job.
 func uninstallWorkerJob(app *App) error {
 	agentsDir, _ := paths.LaunchAgentsDir()
