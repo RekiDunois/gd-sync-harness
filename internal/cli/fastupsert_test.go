@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 )
 
@@ -18,7 +19,7 @@ type fastSettingsT struct {
 // fastBatchForTest runs the worker's due-batch evaluation with a zero settle
 // window so events are immediately due (deterministic and fast).
 func fastBatchForTest(app *App, p *state.Profile) error {
-	return runFastUpsertBatchAt(context.Background(), app, p, nil, time.Now(), fastSettingsT{
+	return runFastUpsertBatchAt(context.Background(), app, p, &policy.Snapshot{}, nil, time.Now(), fastSettingsT{
 		SettleSeconds: 0, MaxDelaySeconds: 30,
 	})
 }

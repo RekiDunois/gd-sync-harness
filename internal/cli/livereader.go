@@ -58,7 +58,7 @@ func (r *liveDurableReader) BuildSnapshot(profileID string, activity *live.Activ
 	if activity == nil && activityProvider != nil {
 		activity = activityProvider(profileID)
 	}
-	return buildSnapshotFromDurable(durable, activity)
+	return buildSnapshotFromDurable(durable, activity, r.db)
 }
 
 // Refresh reloads the durable state for a profile from SQLite. It returns
@@ -75,7 +75,7 @@ func (r *liveDurableReader) Refresh(profileID string) bool {
 }
 
 // buildSnapshotFromDurable composes the public status snapshot (§5.2).
-func buildSnapshotFromDurable(d *state.DurableSnapshot, activity *live.ActivityS) *live.StatusSnapshot {
+func buildSnapshotFromDurable(d *state.DurableSnapshot, activity *live.ActivityS, db *state.DB) *live.StatusSnapshot {
 	p := d.Profile
 	s := live.StatusSnapshot{
 		ProfileID: p.ID,
@@ -138,6 +138,31 @@ func buildSnapshotFromDurable(d *state.DurableSnapshot, activity *live.ActivityS
 			}
 			activity.CurrentItemBytes = run.CurrentItemBytes
 			activity.CurrentItemSize = run.CurrentItemSize
+		}
+	}
+	if d.Policy != nil {
+		pol := d.Policy
+		var sup int
+		if db != nil {
+			sup, _ = db.ManifestSuppressedCount(p.ID)
+		}
+		s.Policy = &live.PolicyS{
+			Source:              pol.PolicySource,
+			PolicyHash:          pol.PolicyHash,
+			CommittedGeneration: pol.CommittedGeneration,
+			RefreshState:        pol.RefreshState,
+			RefreshedPolicyHash: pol.RefreshedPolicyHash,
+			SuppressedCount:     int64(sup),
+			MatcherWarnings:     pol.MatcherWarningCount,
+		}
+	}
+	if d.Prune != nil {
+		pr := d.Prune
+		s.Prune = &live.PruneS{
+			RequestID:      &pr.RequestID,
+			State:          &pr.State,
+			CandidateCount: int64(pr.CandidateCount),
+			CompletedCount: int64(pr.DeletedCount + pr.MissingCount),
 		}
 	}
 	s.Activity = activity

@@ -17,7 +17,6 @@ func migrate(db *sql.DB) error {
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
-
 	var current int
 	if err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
 		return err
@@ -235,6 +234,71 @@ func migrate(db *sql.DB) error {
 		ALTER TABLE profile_sync_state ADD COLUMN pending_manual_bypass_debounce INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE sync_runs ADD COLUMN effective_max_delete INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE sync_runs ADD COLUMN manual_delete_override INTEGER;
+		`,
+		// v9: durable committed ignore policy snapshot (§4, §18.1) and the
+		// active/suppressed managed-ledger evolution (§10). The manifest gains a
+		// state column so a full eligible scan cannot erase suppressed ownership
+		// records; existing rows migrate as active. pending_events gains
+		// durable policy-order evidence for delete-vs-suppress classification
+		// (§9.2).
+		`
+		CREATE TABLE profile_ignore_policy (
+			profile_id TEXT PRIMARY KEY,
+			policy_source TEXT NOT NULL,
+			policy_hash TEXT NOT NULL,
+			committed_generation INTEGER NOT NULL,
+			committed_at TEXT NOT NULL,
+			refresh_state TEXT NOT NULL DEFAULT 'pending',
+			refreshed_policy_hash TEXT,
+			matcher_warning_count INTEGER NOT NULL DEFAULT 0,
+			FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+		);
+		CREATE TABLE profile_ignore_snapshot_files (
+			profile_id TEXT NOT NULL,
+			policy_hash TEXT NOT NULL,
+			relative_path TEXT NOT NULL,
+			scope_dir TEXT NOT NULL,
+			content BLOB NOT NULL,
+			content_order INTEGER NOT NULL,
+			PRIMARY KEY(profile_id, policy_hash, relative_path),
+			FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+		);
+		CREATE INDEX idx_ignore_snapshot_profile ON profile_ignore_snapshot_files(profile_id);
+		ALTER TABLE manifest ADD COLUMN state TEXT NOT NULL DEFAULT 'active';
+		ALTER TABLE manifest ADD COLUMN suppressed_policy_hash TEXT;
+		ALTER TABLE manifest ADD COLUMN suppressed_generation INTEGER;
+		ALTER TABLE pending_events ADD COLUMN observed_policy_hash TEXT;
+		ALTER TABLE pending_events ADD COLUMN observed_policy_generation INTEGER;
+		ALTER TABLE pending_events ADD COLUMN policy_context_known INTEGER NOT NULL DEFAULT 0;
+		CREATE TABLE prune_requests (
+			request_id TEXT PRIMARY KEY,
+			profile_id TEXT NOT NULL,
+			policy_hash TEXT NOT NULL,
+			state TEXT NOT NULL,
+			candidate_count INTEGER NOT NULL,
+			candidate_digest TEXT NOT NULL,
+			default_max_delete INTEGER NOT NULL,
+			authorized_limit INTEGER,
+			deleted_count INTEGER NOT NULL DEFAULT 0,
+			missing_count INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			completed_at TEXT,
+			FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+		);
+		CREATE TABLE prune_targets (
+			request_id TEXT NOT NULL,
+			rel_path TEXT NOT NULL,
+			state TEXT NOT NULL,
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY(request_id, rel_path),
+			FOREIGN KEY(request_id) REFERENCES prune_requests(request_id) ON DELETE CASCADE
+		);
+		CREATE INDEX idx_prune_requests_profile ON prune_requests(profile_id, state, created_at);
+		CREATE INDEX idx_prune_targets_request ON prune_targets(request_id);
 		`,
 	}
 

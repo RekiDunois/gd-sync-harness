@@ -32,6 +32,8 @@ func newProfileCmd() *cobra.Command {
 		profileForgetCmd(),
 		profileMigrateCmd(),
 		profileExcludeCmd(),
+		newIgnoreCmd(),
+		newPruneCmd(),
 	)
 	return c
 }
@@ -394,41 +396,15 @@ func profileExcludeCmd() *cobra.Command {
 	var remove bool
 	c := &cobra.Command{
 		Use:   "exclude <id> <rule-type> <rule-value>",
-		Short: "Add or remove an exclude rule (exclude_path_prefix|exclude_dir_name|exclude_filename|exclude_extension)",
+		Short: "Deprecated: structured excludes are being retired (use .gitignore + `profile ignore update`)",
 		Args:  cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			app, err := NewApp()
-			if err != nil {
-				return err
-			}
-			defer app.Close()
-			p, err := app.requireProfile(args[0])
-			if err != nil {
-				return err
-			}
-			ruleType := args[1]
-			if !state.ValidRuleType(ruleType) {
-				return fmt.Errorf("invalid rule type %q", ruleType)
-			}
-			if remove {
-				if err := app.DB.RemoveExclude(p.ID, ruleType, args[2]); err != nil {
-					return err
-				}
-			} else {
-				if err := app.DB.AddExclude(p.ID, ruleType, args[2]); err != nil {
-					return err
-				}
-			}
-			_ = app.DB.RequestReconcile(p.ID)
-			action := "added"
-			if remove {
-				action = "removed"
-			}
-			fmt.Printf("exclude rule %s (%s:%s); full reconciliation requested\n", action, ruleType, args[2])
-			return nil
+			// The legacy structured-rule surface is retired (§17.2). Refuse
+			// before any DB access so the migration boundary is always shown.
+			return fmt.Errorf("structured exclude editing is deprecated; edit .gitignore and run `profile ignore update`")
 		},
 	}
-	c.Flags().BoolVar(&remove, "remove", false, "remove the rule instead of adding")
+	c.Flags().BoolVar(&remove, "remove", false, "remove the rule instead of adding (deprecated)")
 	return c
 }
 

@@ -2,13 +2,41 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 	"knowledge-sync/internal/sync"
 )
+
+// scanProfileActive computes the active local file set under the committed
+// policy snapshot (§16.2). It returns a ScanResult-shaped view for the status
+// renderer.
+func scanProfileActive(app *App, p *state.Profile) (*sync.ScanResult, error) {
+	snap, err := app.DB.GetCommittedSnapshot(p.ID)
+	if err != nil {
+		return nil, err
+	}
+	if snap == nil {
+		snap = &policy.Snapshot{}
+	}
+	active, err := sync.ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
+	if err != nil {
+		return nil, err
+	}
+	res := &sync.ScanResult{}
+	for _, rel := range active {
+		fi, err := os.Stat(joinSource(p.SourcePath, rel))
+		if err != nil {
+			continue
+		}
+		res.Entries = append(res.Entries, sync.ScanEntry{RelPath: rel, Size: fi.Size(), ModTime: fi.ModTime().Unix()})
+	}
+	return res, nil
+}
 
 func newStatusCmd() *cobra.Command {
 	var refreshQuota bool
@@ -74,8 +102,10 @@ func renderProfileStatus(app *App, p *state.Profile) error {
 	pending, _ := app.DB.CountPending(p.ID)
 	manifestCount, _ := app.DB.ManifestCount(p.ID)
 
-	// §10.4: report skipped symlinks and oversize files in status.
-	scan, scanErr := sync.ScanLocal(p)
+	// Report active local files under the committed policy snapshot, plus
+	// skipped symlinks/oversize files (§10.4). This reflects the durable policy
+	// rather than the legacy structured filter.
+	scan, scanErr := scanProfileActive(app, p)
 
 	fmt.Printf("%s  [%s]\n", p.ID, health)
 	fmt.Printf("  type:              %s\n", p.Type)
@@ -115,6 +145,7 @@ func renderProfileStatus(app *App, p *state.Profile) error {
 		fmt.Printf("  quota %s:         %s used / %s total / %s free [%s]\n",
 			p.RemoteName, humanBytes(q.UsedBytes), humanBytes(q.TotalBytes), humanBytes(q.FreeBytes), q.QuotaStatus)
 	}
+	renderPolicyPruneSummary(app, p.ID)
 	if scanErr == nil && len(scan.SkippedSymlinks) > 0 {
 		fmt.Println("  skipped symlinks (§10.4):")
 		for i, s := range scan.SkippedSymlinks {

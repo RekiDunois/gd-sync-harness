@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"knowledge-sync/internal/exec"
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 )
 
@@ -33,6 +34,10 @@ func mockRclone(t *testing.T) (*exec.Rclone, string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("set mock root: %v: %s", err, out)
 	}
+	// The local backend root is the process CWD (config `root =` is written but
+	// not honored at runtime), so anchor CWD to the throwaway remote root so
+	// remote reads/writes never pollute the package directory.
+	t.Chdir(root)
 	return exec.NewRclone(bin, conf), root
 }
 
@@ -70,7 +75,9 @@ func TestFastUpsertAndVerify(t *testing.T) {
 	}
 }
 
-func TestFullSyncDeletes(t *testing.T) {
+// TestFullSyncDeletesProven verifies proven local deletions are removed via the
+// protected reconciliation path within the delete budget (§11.3 invariant 2).
+func TestFullSyncDeletesProven(t *testing.T) {
 	r, _ := mockRclone(t)
 	ctx := context.Background()
 	src := filepath.Join(t.TempDir(), "src")
@@ -83,8 +90,14 @@ func TestFullSyncDeletes(t *testing.T) {
 	p := newTestProfile(t, src, "mock", "mirror")
 	svc := New(r, nil)
 
-	if err := svc.FullSync(ctx, p, SyncOptions{}); err != nil {
-		t.Fatalf("initial full sync: %v", err)
+	// Establish the mirror with all three files.
+	initList, _, err := writeFilesFromTest(t, []string{"keep.md", "gone.md", "sub/x.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(initList)
+	if res := r.Run(ctx, "sync", "--files-from", initList, src, "mock:mirror"); res.Err != nil {
+		t.Fatalf("initial sync: %v", res.Err)
 	}
 	for _, f := range []string{"keep.md", "gone.md", "sub/x.md"} {
 		if readRemote(t, r, "mock", "mirror/"+f) == "" {
@@ -92,26 +105,27 @@ func TestFullSyncDeletes(t *testing.T) {
 		}
 	}
 
+	// Delete gone.md locally.
 	if err := os.Remove(filepath.Join(src, "gone.md")); err != nil {
 		t.Fatal(err)
 	}
 
-	dry, err := svc.DryRunSync(ctx, p, SyncOptions{})
-	if err != nil {
-		t.Fatalf("dry run: %v", err)
+	// Protected full sync with the proven-delete path removes it.
+	snap := policy.IgnoreSnapshot{}
+	if _, err := svc.FullSyncProtected(ctx, p, &snap, SyncOptions{}, nil); err != nil {
+		t.Fatalf("protected sync: %v", err)
 	}
-	if dry.ToDelete != 1 {
-		t.Fatalf("dry-run deleted = %d, want 1", dry.ToDelete)
-	}
-
-	if err := svc.FullSync(ctx, p, SyncOptions{}); err != nil {
-		t.Fatalf("full sync after delete: %v", err)
+	if err := svc.DeleteRemotePaths(ctx, p, []string{"gone.md"}); err != nil {
+		t.Fatalf("delete proven: %v", err)
 	}
 	if readRemote(t, r, "mock", "mirror/gone.md") != "" {
 		t.Fatal("gone.md should be removed from remote")
 	}
 	if readRemote(t, r, "mock", "mirror/keep.md") != "k" {
 		t.Fatal("keep.md should remain")
+	}
+	if readRemote(t, r, "mock", "mirror/sub/x.md") != "x" {
+		t.Fatal("sub/x.md should remain")
 	}
 }
 
@@ -133,10 +147,10 @@ Elapsed time:         0.1s`
 	}
 }
 
-// TestExcludeChangeRemovesRemote validates §17: a previously mirrored file that
-// becomes excluded must be removed by the next full reconciliation, and the
-// delete must be counted in preflight so the budget protects it.
-func TestExcludeChangeRemovesRemote(t *testing.T) {
+// TestExcludeChangeBecomesSuppressed validates the new suppression model (§11):
+// a previously mirrored file that becomes excluded by committed policy is
+// suppressed and survives ordinary reconcile; it is never auto-removed.
+func TestExcludeChangeBecomesSuppressed(t *testing.T) {
 	r, _ := mockRclone(t)
 	ctx := context.Background()
 	src := filepath.Join(t.TempDir(), "src")
@@ -147,35 +161,152 @@ func TestExcludeChangeRemovesRemote(t *testing.T) {
 	p := newTestProfile(t, src, "mock", "mirror")
 	svc := New(r, nil)
 
-	// Initial full sync mirrors both.
-	if err := svc.FullSync(ctx, p, SyncOptions{}); err != nil {
-		t.Fatalf("initial sync: %v", err)
+	// Initial mirror with both files.
+	initList, _, err := writeFilesFromTest(t, []string{"keep.md", "tmp.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(initList)
+	if res := r.Run(ctx, "sync", "--files-from", initList, src, "mock:mirror"); res.Err != nil {
+		t.Fatalf("initial sync: %v", res.Err)
 	}
 	if readRemote(t, r, "mock", "mirror/tmp.bin") != "t" {
 		t.Fatal("tmp.bin should be mirrored initially")
 	}
 
-	// Now exclude *.bin (simulates a filter change).
-	p.Excludes = append(p.Excludes, "exclude_extension:bin")
-
-	// Dry-run must predict the removal (with --delete-excluded).
-	dry, err := svc.DryRunSync(ctx, p, SyncOptions{})
+	// Now tmp.bin becomes excluded by policy. Active = keep.md only.
+	snap := policy.IgnoreSnapshot{Files: []policy.File{
+		{RelativePath: ".gitignore", ScopeDir: "", Content: []byte("tmp.bin\n")},
+	}}
+	active, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, &snap)
 	if err != nil {
-		t.Fatalf("dry-run: %v", err)
+		t.Fatal(err)
 	}
-	if dry.ToDelete < 1 {
-		t.Fatalf("preflight should predict removal of excluded file; deleted=%d", dry.ToDelete)
+	if len(active) != 1 || active[0] != "keep.md" {
+		t.Fatalf("active = %v", active)
 	}
 
-	// Live sync removes it.
-	if err := svc.FullSync(ctx, p, SyncOptions{}); err != nil {
-		t.Fatalf("sync after exclude: %v", err)
+	// Protected sync must NOT delete the excluded tmp.bin (it is suppressed,
+	// not an ordinary delete candidate).
+	if _, err := svc.FullSyncProtected(ctx, p, &snap, SyncOptions{}, nil); err != nil {
+		t.Fatalf("protected sync: %v", err)
 	}
-	if readRemote(t, r, "mock", "mirror/tmp.bin") != "" {
-		t.Fatal("excluded tmp.bin should be removed from remote (§17)")
+	if readRemote(t, r, "mock", "mirror/tmp.bin") != "t" {
+		t.Fatal("excluded tmp.bin must survive (suppressed, not deleted)")
 	}
 	if readRemote(t, r, "mock", "mirror/keep.md") != "k" {
 		t.Fatal("keep.md should remain")
+	}
+}
+
+// TestReconcileProtectedSuppressedSurvives is the rclone integration spike for
+// §11.3 invariant 4: a suppressed remote object survives ordinary protected
+// reconciliation.
+func TestReconcileProtectedSuppressedSurvives(t *testing.T) {
+	r, root := mockRclone(t)
+	ctx := context.Background()
+	src := filepath.Join(t.TempDir(), "src")
+	mkdirAll(t, src)
+	mkfile(t, src, "keep.md", "k")
+	mkfile(t, src, "secret.md", "s")
+
+	p := newTestProfile(t, src, "mock", "mirror")
+	svc := New(r, nil)
+
+	// Establish the mirror with both files.
+	initList, _, err := writeFilesFromTest(t, []string{"keep.md", "secret.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(initList)
+	res := r.Run(ctx, "sync", "--files-from", initList, src, "mock:mirror")
+	if res.Err != nil {
+		t.Fatalf("init sync: %v", res.Err)
+	}
+
+	// Now secret.md becomes suppressed (ignored by policy). Active = keep.md.
+	snap := policy.IgnoreSnapshot{Files: []policy.File{
+		{RelativePath: ".gitignore", ScopeDir: "", Content: []byte("secret.md\nother.md\n")},
+	}}
+	active, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, &snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0] != "keep.md" {
+		t.Fatalf("active = %v", active)
+	}
+
+	// Protected full sync must NOT delete the suppressed secret.md remotely.
+	if _, err := svc.FullSyncProtected(ctx, p, &snap, SyncOptions{}, nil); err != nil {
+		t.Fatalf("protected sync: %v", err)
+	}
+	if readRemote(t, r, "mock", "mirror/secret.md") != "s" {
+		t.Fatal("suppressed secret.md must survive ordinary protected reconcile")
+	}
+	if readRemote(t, r, "mock", "mirror/keep.md") != "k" {
+		t.Fatal("active keep.md must remain")
+	}
+
+	// A new ignored local file must not be uploaded.
+	mkfile(t, src, "other.md", "o")
+	mkfile(t, src, "secret2.md", "s2")
+	if _, err := svc.FullSyncProtected(ctx, p, &snap, SyncOptions{}, nil); err != nil {
+		t.Fatalf("protected sync 2: %v", err)
+	}
+	if readRemote(t, r, "mock", "mirror/other.md") != "" {
+		t.Fatal("ignored local file must not be uploaded")
+	}
+	_ = root
+}
+
+// TestReconcileProtectedDeletesProvenPaths is the §11.3 invariant 2 spike:
+// proven local deletes are removed within the ordinary delete budget, and a
+// reactivated file resumes synchronization.
+func TestReconcileProtectedDeletesProvenPaths(t *testing.T) {
+	r, _ := mockRclone(t)
+	ctx := context.Background()
+	src := filepath.Join(t.TempDir(), "src")
+	mkdirAll(t, src)
+	mkfile(t, src, "keep.md", "k")
+	mkfile(t, src, "gone.md", "g")
+
+	p := newTestProfile(t, src, "mock", "mirror")
+	svc := New(r, nil)
+
+	initList, _, err := writeFilesFromTest(t, []string{"keep.md", "gone.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(initList)
+	if res := r.Run(ctx, "sync", "--files-from", initList, src, "mock:mirror"); res.Err != nil {
+		t.Fatalf("init sync: %v", res.Err)
+	}
+
+	// Delete gone.md locally; keep.md active.
+	if err := os.Remove(filepath.Join(src, "gone.md")); err != nil {
+		t.Fatal(err)
+	}
+	snap := policy.IgnoreSnapshot{}
+	active, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, &snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0] != "keep.md" {
+		t.Fatalf("active = %v", active)
+	}
+
+	// Protected reconcile with provenDeletes=[gone.md] removes it.
+	if _, err := svc.FullSyncProtected(ctx, p, &snap, SyncOptions{}, nil); err != nil {
+		t.Fatalf("protected sync: %v", err)
+	}
+	if err := svc.DeleteRemotePaths(ctx, p, []string{"gone.md"}); err != nil {
+		t.Fatalf("delete proven: %v", err)
+	}
+	if readRemote(t, r, "mock", "mirror/gone.md") != "" {
+		t.Fatal("proven delete must be removed")
+	}
+	if readRemote(t, r, "mock", "mirror/keep.md") != "k" {
+		t.Fatal("keep.md must remain")
 	}
 }
 
@@ -191,6 +322,12 @@ func readRemote(t *testing.T, r *exec.Rclone, remote, path string) string {
 		return ""
 	}
 	return string(b)
+}
+
+func writeFilesFromTest(t *testing.T, files []string) (string, []string, error) {
+	t.Helper()
+	list, err := writeFilesFrom(files)
+	return list, files, err
 }
 
 func mkdirAll(t *testing.T, path string) {

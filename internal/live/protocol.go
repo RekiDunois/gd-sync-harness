@@ -24,6 +24,7 @@ const (
 const (
 	ActivityFullReconcile = "full_reconcile"
 	ActivityFastUpsert    = "fast_upsert"
+	ActivityPrune         = "prune"
 )
 
 // Message is the envelope for every NDJSON frame on the socket. Unknown fields

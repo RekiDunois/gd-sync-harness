@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 	"knowledge-sync/internal/sync"
 )
@@ -35,9 +36,24 @@ func newSyncNowCmd() *cobra.Command {
 // (§13.1, §13.2). Deletes upgrade to a full reconciliation intent. It never
 // runs rclone in the CLI process.
 func runSyncNow(app *App, p *state.Profile) error {
-	scan, err := sync.ScanLocal(p)
+	snap, err := app.DB.GetCommittedSnapshot(p.ID)
 	if err != nil {
 		return err
+	}
+	if snap == nil {
+		snap = &policy.Snapshot{}
+	}
+	active, err := sync.ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
+	if err != nil {
+		return err
+	}
+	scan := &sync.ScanResult{}
+	for _, rel := range active {
+		fi, err := os.Stat(joinSource(p.SourcePath, rel))
+		if err != nil {
+			continue
+		}
+		scan.Entries = append(scan.Entries, sync.ScanEntry{RelPath: rel, Size: fi.Size(), ModTime: fi.ModTime().Unix()})
 	}
 
 	manifest, err := app.DB.ManifestAll(p.ID)
@@ -51,6 +67,19 @@ func runSyncNow(app *App, p *state.Profile) error {
 		return err
 	}
 	if len(deletes) > 0 || destructivePending {
+		// Record each local deletion as a durable destructive event so the
+		// worker's delete-vs-suppress classification has policy-order evidence
+		// (§9.2). The committed policy hash is captured with the event.
+		pol, _ := app.DB.GetCommittedPolicy(p.ID)
+		for _, rel := range deletes {
+			hash := ""
+			if pol != nil {
+				hash = pol.PolicyHash
+			}
+			if _, err := app.DB.RecordEventWithPolicy(p.ID, rel, state.EventDelete, true, hash); err != nil {
+				return err
+			}
+		}
 		fmt.Printf("sync-now %s: %d local deletes detected; upgrading to full reconciliation\n", p.ID, len(deletes))
 		// Submit durable intent and let the worker own execution.
 		return runReconcile(app, p, sync.SyncOptions{}, false)

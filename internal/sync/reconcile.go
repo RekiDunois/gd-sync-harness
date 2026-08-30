@@ -3,8 +3,11 @@ package sync
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"knowledge-sync/internal/exec"
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 )
 
@@ -16,36 +19,33 @@ type Reconciler struct {
 // NewReconciler builds a Reconciler.
 func NewReconciler(s *Service) *Reconciler { return &Reconciler{Service: s} }
 
-// Reconcile runs the complete safety flow:
+// ReconcileProtected runs the complete safety flow against an owned committed
+// policy snapshot (§11). It:
 //
-//  1. stable-generation preflight;
-//  2. authoritative dry-run / preflight;
+//  1. stable-generation preflight using the owned active set;
+//  2. authoritative dry-run over the active list (no --delete-excluded, so
+//     suppressed remote objects are protected);
 //  3. if source changed during preflight → discard, restart;
-//  4. if expected deletions exceed budget (unless overridden) → fail closed;
-//  5. run live destructive sync with rclone's --max-delete guard;
-//  6. mark profile dirty if local changes occurred during live sync.
-func (r *Reconciler) Reconcile(ctx context.Context, p *state.Profile, options SyncOptions) (*PreflightResult, error) {
-	pre, err := r.ReconcileProgress(ctx, p, options, nil)
-	return pre, err
+//  4. if proven-delete count exceeds the budget → fail closed;
+//  5. run the live non-destructive upload for the active set;
+//  6. delete only the proven ordinary local deletions within the budget;
+//  7. mark profile dirty if local changes occurred during live sync.
+//
+// Suppressed objects are never counted as ordinary deletion candidates (§11.4).
+func (r *Reconciler) ReconcileProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, options SyncOptions, provenDeletes []string) (*PreflightResult, error) {
+	return r.reconcileProtected(ctx, p, snap, options, provenDeletes, nil, nil)
 }
 
-// ReconcileProgress is Reconcile with best-effort transfer progress callbacks
-// (§10.1). onStats may be nil.
-func (r *Reconciler) ReconcileProgress(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats)) (*PreflightResult, error) {
-	return r.reconcileProgress(ctx, p, options, onStats, nil)
+// ReconcileProtectedProgress is ReconcileProtected with progress callbacks.
+func (r *Reconciler) ReconcileProtectedProgress(ctx context.Context, p *state.Profile, snap *policy.Snapshot, options SyncOptions, provenDeletes []string, onStats func(exec.ProgressStats), onPhase func(string)) (*PreflightResult, error) {
+	return r.reconcileProtected(ctx, p, snap, options, provenDeletes, onStats, onPhase)
 }
 
-// ReconcileProgressWithPhase exposes the real planning/uploading boundary to
-// status without duplicating the reconciliation algorithm.
-func (r *Reconciler) ReconcileProgressWithPhase(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats), onPhase func(string)) (*PreflightResult, error) {
-	return r.reconcileProgress(ctx, p, options, onStats, onPhase)
-}
-
-func (r *Reconciler) reconcileProgress(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats), onPhase func(string)) (*PreflightResult, error) {
+func (r *Reconciler) reconcileProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, options SyncOptions, provenDeletes []string, onStats func(exec.ProgressStats), onPhase func(string)) (*PreflightResult, error) {
 	if onPhase != nil {
 		onPhase(state.PhasePlanning)
 	}
-	pre, err := r.Preflight(ctx, p, options)
+	pre, err := r.PreflightProtected(ctx, p, snap, options)
 	if err != nil {
 		return nil, err
 	}
@@ -55,56 +55,71 @@ func (r *Reconciler) reconcileProgress(ctx context.Context, p *state.Profile, op
 	if !pre.SourceStable {
 		return nil, ErrSourceUnstable
 	}
-	if pre.ToDelete > effectiveDeleteLimit(p, options) {
+	// The delete budget guards proven ordinary deletions only. Suppressed
+	// objects are not candidates (§11.4).
+	effective := effectiveDeleteLimit(p, options)
+	if len(provenDeletes) > effective {
 		return pre, ErrDeleteBudgetExceeded
 	}
 	if onPhase != nil {
 		onPhase(state.PhaseUploading)
 	}
-	if _, err := r.Service.fullSync(ctx, p, options, onStats); err != nil {
+	if _, err := r.Service.FullSyncProtected(ctx, p, snap, options, onStats); err != nil {
 		return pre, err
 	}
-	if err := r.markDirtyIfChanged(ctx, p, pre); err != nil {
+	if len(provenDeletes) > 0 {
+		if onPhase != nil {
+			onPhase(state.PhaseDeleting)
+		}
+		if err := r.Service.DeleteRemotePaths(ctx, p, provenDeletes); err != nil {
+			return pre, err
+		}
+	}
+	if err := r.markDirtyIfChangedProtected(ctx, p, snap, pre); err != nil {
 		return pre, err
 	}
 	return pre, nil
 }
 
-// Preflight performs the dry-run against a stable source generation.
-func (r *Reconciler) Preflight(ctx context.Context, p *state.Profile, options SyncOptions) (*PreflightResult, error) {
-	scan1, err := ScanLocal(p)
+// PreflightProtected performs the dry-run against a stable source generation
+// under the owned policy snapshot.
+func (r *Reconciler) PreflightProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, options SyncOptions) (*PreflightResult, error) {
+	active1, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return nil, err
 	}
-	fp1 := scan1.ChangedFingerprint()
+	fp1 := fingerprintPaths(active1)
 
-	dry, err := r.Service.DryRunSync(ctx, p, options)
+	dry, err := r.Service.DryRunSyncProtected(ctx, p, snap, options)
 	if err != nil {
 		return nil, err
 	}
-	dry.SourceFiles = len(scan1.Entries)
+	dry.SourceFiles = len(active1)
 	dry.SourceFingerprint = fp1
 
-	scan2, err := ScanLocal(p)
+	active2, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return nil, err
 	}
-	fp2 := scan2.ChangedFingerprint()
-	dry.SourceStable = fp1 == fp2
-
+	dry.SourceStable = fp1 == fingerprintPaths(active2)
 	return dry, nil
 }
 
-// markDirtyIfChanged re-scans after the live sync and advances desired
-// reconciliation intent if the source changed during sync (§15.1.7). Advancing
-// the durable generation leaves the follow-up reconciliation eligible; it never
-// expands the already-completed run's target (§20).
-func (r *Reconciler) markDirtyIfChanged(ctx context.Context, p *state.Profile, pre *PreflightResult) error {
-	scan, err := ScanLocal(p)
+// fingerprintPaths is a stable, order-independent fingerprint of a path set.
+func fingerprintPaths(paths []string) string {
+	sorted := append([]string(nil), paths...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, "\x00")
+}
+
+// markDirtyIfChangedProtected re-scans after the live sync and advances desired
+// reconciliation intent if the source changed during sync (§15.1.7).
+func (r *Reconciler) markDirtyIfChangedProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, pre *PreflightResult) error {
+	active, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return err
 	}
-	if scan.ChangedFingerprint() != pre.SourceFingerprint {
+	if fingerprintPaths(active) != pre.SourceFingerprint {
 		gen, err := r.Service.DB.BumpGeneration(p.ID)
 		if err != nil {
 			return err

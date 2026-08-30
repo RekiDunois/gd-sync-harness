@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"knowledge-sync/internal/exec"
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/remote"
 	"knowledge-sync/internal/sidecar"
 	"knowledge-sync/internal/state"
@@ -126,7 +127,20 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 		return nil, err
 	}
 
+	// Capture the initial .gitignore snapshot before first synchronization
+	// (§6.1). A source with no .gitignore commits a valid empty policy. If
+	// snapshot collection fails, fail profile creation rather than starting an
+	// unsafe first upload.
+	snap, err := policy.CollectSnapshot(abs)
+	if err != nil {
+		return nil, fmt.Errorf("capture initial ignore policy: %w", err)
+	}
+
 	if err := s.DB.CreateProfile(p); err != nil {
+		return nil, err
+	}
+
+	if err := s.DB.CommitPolicyForNewProfile(o.ID, snap); err != nil {
 		return nil, err
 	}
 

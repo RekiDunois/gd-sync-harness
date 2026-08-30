@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,6 +20,7 @@ import (
 	"knowledge-sync/internal/live"
 	"knowledge-sync/internal/logger"
 	"knowledge-sync/internal/paths"
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/sidecar"
 	"knowledge-sync/internal/state"
 	"knowledge-sync/internal/sync"
@@ -177,8 +179,8 @@ func workerLog(lg *log.Logger) *log.Logger {
 }
 
 // runWorkerPass performs one scheduling pass: claim and execute eligible
-// reconciliation for each active profile, drain due fast events, then finalize
-// pending deletions (§13.3).
+// reconciliation for each active profile, drain due fast events, execute
+// authorized prune requests, then finalize pending deletions (§13.3).
 func runWorkerPass(ctx context.Context, app *App, onlyProfile string, lg *log.Logger) error {
 	lg = workerLog(lg)
 	if ctx == nil {
@@ -211,16 +213,31 @@ func runWorkerPass(ctx context.Context, app *App, onlyProfile string, lg *log.Lo
 			stopRenewal := startLeaseRenewal(ctx, app.DB, lease)
 			defer stopRenewal()
 			defer app.DB.ReleaseRemoteLease(lease)
+
+			// After acquiring the profile operation lock, reload the durable
+			// profile + committed policy snapshot; never treat the scheduling
+			// scan's profile object as execution authority (§8.3, §20.1).
+			ownedProfile, ownedSnapshot, err := loadOwnedExecutionState(app, p.ID)
+			if err != nil {
+				lg.Printf("load owned state %s: %v", p.ID, err)
+				return
+			}
+
 			run, res, err := app.DB.ClaimRun(p.ID, newRunID())
 			if err != nil {
 				lg.Printf("claim %s: %v", p.ID, err)
 				return
 			}
 			if res != state.ClaimOK {
-				// No full reconciliation was claimable; a due fast-event batch
-				// may still be eligible (§13.3: full debt wins, so we only
-				// drain fast events when full debt is absent).
-				if err := runFastUpsertBatch(ctx, app, p, lg); err != nil {
+				// No full reconciliation was claimable. Priority 3 (§15):
+				// execute an authorized prune (full/policy debt already won if
+				// claimable). Prune cannot run until the policy refresh is
+				// ready for the committed hash, which this path guarantees.
+				if err := runAuthorizedPrune(ctx, app, ownedProfile, ownedSnapshot, lg); err != nil {
+					lg.Printf("prune %s: %v", p.ID, err)
+				}
+				// Then a due fast-event batch may still be eligible (§13.3).
+				if err := runFastUpsertBatchOwned(ctx, app, ownedProfile, ownedSnapshot, lg); err != nil {
 					lg.Printf("fast upsert %s: %v", p.ID, err)
 				}
 				return
@@ -230,7 +247,7 @@ func runWorkerPass(ctx context.Context, app *App, onlyProfile string, lg *log.Lo
 			// result, not from the original CLI process (§11.4). The effective
 			// delete limit was atomically captured at claim time.
 			options := sync.SyncOptions{AllowDeletes: run.EffectiveMaxDelete}
-			if err := executeReconcileAttempt(app, p, run, options, true, lg); err != nil {
+			if err := executeReconcileAttemptOwned(app, ownedProfile, ownedSnapshot, run, options, true, lg); err != nil {
 				lg.Printf("run %s (%s) failed: %v", run.ID, p.ID, err)
 			} else {
 				lg.Printf("run %s (%s) succeeded", run.ID, p.ID)
@@ -238,6 +255,27 @@ func runWorkerPass(ctx context.Context, app *App, onlyProfile string, lg *log.Lo
 		}()
 	}
 	return finalizeDeletions(app)
+}
+
+// loadOwnedExecutionState reloads the durable profile and committed policy
+// snapshot after profile-lock acquisition (§8.3).
+func loadOwnedExecutionState(app *App, profileID string) (*state.Profile, *policy.Snapshot, error) {
+	p, err := app.DB.GetProfile(profileID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if p.Tombstoned || !p.Enabled || p.DeletionRequestedAt != nil {
+		return nil, nil, fmt.Errorf("profile %q is not runnable", profileID)
+	}
+	snap, err := app.DB.GetCommittedSnapshot(profileID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if snap == nil {
+		// No committed policy: treat as a safe empty gitignore policy.
+		snap = &policy.Snapshot{}
+	}
+	return p, snap, nil
 }
 
 // finalizeDeletions tombstones profiles with a durable deletion request once no
@@ -266,11 +304,10 @@ func finalizeDeletions(app *App) error {
 	return nil
 }
 
-// executeReconcileAttempt runs a claimed reconciliation through the normal
-// worker-owned path and atomically commits success/failure (§24.2). It is the
-// single shared execution path for the worker, the CLI reconcile commands, and
-// --wait observation.
-func executeReconcileAttempt(app *App, p *state.Profile, run *state.SyncRun, options sync.SyncOptions, scheduled bool, lg *log.Logger) error {
+// executeReconcileAttemptOwned runs a claimed reconciliation through the
+// worker-owned path under the reloaded durable profile and committed policy
+// snapshot, and atomically commits success/failure (§8.3, §24.2).
+func executeReconcileAttemptOwned(app *App, p *state.Profile, snap *policy.Snapshot, run *state.SyncRun, options sync.SyncOptions, scheduled bool, lg *log.Logger) error {
 	ctx, cancel := app.Context()
 	defer cancel()
 
@@ -293,15 +330,49 @@ func executeReconcileAttempt(app *App, p *state.Profile, run *state.SyncRun, opt
 	app.activities().setPhase(p.ID, state.PhaseScanning)
 	publishLive()
 
-	scan, err := sync.ScanLocalProgress(p, func(progress sync.ScanProgress) {
-		_ = app.DB.UpdateRunFilesDiscovered(p.ID, run.ID, int64(progress.Eligible))
-	})
+	scan, err := sync.ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return commitFailure(app, p, run, err, "local_scan")
 	}
-	if err := app.DB.UpdateRunFilesDiscovered(p.ID, run.ID, int64(len(scan.Entries))); err != nil {
+	if err := app.DB.UpdateRunFilesDiscovered(p.ID, run.ID, int64(len(scan))); err != nil {
 		return err
 	}
+
+	// Determine whether this claim carries policy-refresh debt (committed hash
+	// differs from the last refreshed hash) and mark it running. The policy
+	// refresh is part of this full reconciliation's durable ledger
+	// classification (§8.4, §20.2).
+	pol, _ := app.DB.GetCommittedPolicy(p.ID)
+	policyDebt := false
+	if pol != nil && (pol.RefreshedPolicyHash == nil || *pol.RefreshedPolicyHash != pol.PolicyHash) {
+		policyDebt = true
+		if err := app.DB.MarkPolicyRefreshRunning(p.ID, pol.PolicyHash); err != nil {
+			return err
+		}
+	}
+
+	// Classify proven ordinary deletions vs suppression using durable event
+	// chronology BEFORE the remote reconcile so they are deleted within the
+	// ordinary delete budget (§9.2, §11.4).
+	active := make(map[string]bool, len(scan))
+	for _, rel := range scan {
+		active[rel] = true
+	}
+	var evidence *state.EventEvidence
+	if pol != nil {
+		evidence, err = app.DB.ClassifyDisappearances(p.ID, pol.PolicyHash, active, snap)
+		if err != nil {
+			return commitFailure(app, p, run, err, "disappearance_classify")
+		}
+	} else {
+		evidence = &state.EventEvidence{DeletePaths: map[string]bool{}}
+	}
+	provenDeletes := make([]string, 0, len(evidence.DeletePaths))
+	for pth := range evidence.DeletePaths {
+		provenDeletes = append(provenDeletes, pth)
+	}
+	sort.Strings(provenDeletes)
+
 	var previous *rcexec.ProgressStats
 	checkpoint := newCheckpointTracker()
 	// Phase transitions are required durable checkpoints (§9.2).
@@ -314,7 +385,7 @@ func executeReconcileAttempt(app *App, p *state.Profile, run *state.SyncRun, opt
 			}
 		}
 	}
-	pre, err := app.Reconciler.ReconcileProgressWithPhase(ctx, p, options, func(s rcexec.ProgressStats) {
+	pre, err := app.Reconciler.ReconcileProtectedProgress(ctx, p, snap, options, provenDeletes, func(s rcexec.ProgressStats) {
 		measurable := s.MeasurableProgress(previous)
 		snapshot := progressSnapshot(s)
 		// Live memory update + throughput estimate + status publish (§9.1).
@@ -343,7 +414,22 @@ func executeReconcileAttempt(app *App, p *state.Profile, run *state.SyncRun, opt
 	}
 	app.activities().setPhase(p.ID, state.PhaseFinalizing)
 	publishLive()
-	if err := refreshManifest(app.DB, p, pre); err != nil {
+
+	// Apply the committed policy to the managed ledger after the remote
+	// reconcile succeeded, then mark the policy refresh ready for that hash
+	// (§20.2 conservative boundary: refresh ready only when ordinary
+	// reconciliation established the protected active/suppressed remote model).
+	if policyDebt && pol != nil {
+		gen := run.TargetGeneration
+		if err := app.DB.ApplyManagedRefresh(p.ID, pol.PolicyHash, gen, active, evidence.DeletePaths); err != nil {
+			return commitFailure(app, p, run, err, "policy_refresh")
+		}
+		if err := app.DB.MarkPolicyRefreshReady(p.ID, pol.PolicyHash); err != nil {
+			return err
+		}
+	}
+
+	if err := refreshManifestOwned(app.DB, p, pre, snap); err != nil {
 		return commitFailure(app, p, run, err, "manifest_refresh")
 	}
 	if err := app.DB.CommitRunSuccess(p.ID, run.ID, run.TargetGeneration); err != nil {
@@ -357,6 +443,38 @@ func executeReconcileAttempt(app *App, p *state.Profile, run *state.SyncRun, opt
 			p.ID, pre.SourceFiles, pre.ToCopy, pre.ToDelete)
 	}
 	return nil
+}
+
+// refreshManifestOwned rebuilds the durable managed ledger from the local
+// source using the owned policy snapshot. It uses state-aware apply so
+// suppressed ownership records are never erased by a full eligible scan (§10.3).
+func refreshManifestOwned(db *state.DB, p *state.Profile, pre *sync.PreflightResult, snap *policy.Snapshot) error {
+	scan, err := sync.ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
+	if err != nil {
+		return err
+	}
+	entries := make([]state.ManifestEntry, 0, len(scan))
+	for _, rel := range scan {
+		entries = append(entries, state.ManifestEntry{ProfileID: p.ID, RelPath: rel,
+			Size: sizeOf(joinSource(p.SourcePath, rel)), ModTime: modTimeOf(joinSource(p.SourcePath, rel))})
+	}
+	return db.ManifestApply(p.ID, entries)
+}
+
+func sizeOf(abs string) int64 {
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+func modTimeOf(abs string) int64 {
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return 0
+	}
+	return fi.ModTime().Unix()
 }
 
 // commitFailure persists a structured failure and returns the original error.
@@ -426,22 +544,6 @@ func acquireProfileLock(app *App, p *state.Profile) (*flock.Lock, error) {
 		lockDir = filepath.Join(stateDir, "locks")
 	}
 	return flock.Acquire(lockDir, p.ID)
-}
-
-// refreshManifest rebuilds the durable manifest from the local source after a
-// successful reconciliation.
-func refreshManifest(db *state.DB, p *state.Profile, pre *sync.PreflightResult) error {
-	scan, err := sync.ScanLocal(p)
-	if err != nil {
-		return err
-	}
-	entries := make([]state.ManifestEntry, 0, len(scan.Entries))
-	for _, e := range scan.Entries {
-		entries = append(entries, state.ManifestEntry{
-			ProfileID: p.ID, RelPath: e.RelPath, Size: e.Size, ModTime: e.ModTime,
-		})
-	}
-	return db.ManifestReplaceAll(p.ID, entries)
 }
 
 func progressSnapshot(s rcexec.ProgressStats) state.ProgressSnapshot {

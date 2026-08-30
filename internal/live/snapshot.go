@@ -14,6 +14,8 @@ type StatusSnapshot struct {
 	SampledAt       time.Time  `json:"sampled_at"`
 	Profile         ProfileS   `json:"profile"`
 	Sync            SyncS      `json:"sync"`
+	Policy          *PolicyS   `json:"policy,omitempty"`
+	Prune           *PruneS    `json:"prune,omitempty"`
 	Activity        *ActivityS `json:"activity,omitempty"`
 }
 
@@ -22,6 +24,25 @@ type ProfileS struct {
 	Enabled           bool `json:"enabled"`
 	Tombstoned        bool `json:"tombstoned"`
 	DeletionRequested bool `json:"deletion_requested"`
+}
+
+// PolicyS is the durable committed policy summary (§16.1).
+type PolicyS struct {
+	Source              string  `json:"source"`
+	PolicyHash          string  `json:"policy_hash"`
+	CommittedGeneration int64   `json:"committed_generation"`
+	RefreshState        string  `json:"refresh_state"`
+	RefreshedPolicyHash *string `json:"refreshed_policy_hash,omitempty"`
+	SuppressedCount     int64   `json:"suppressed_count"`
+	MatcherWarnings     int     `json:"matcher_warnings"`
+}
+
+// PruneS is the durable prune request summary (§16.1).
+type PruneS struct {
+	RequestID      *string `json:"request_id,omitempty"`
+	State          *string `json:"state,omitempty"`
+	CandidateCount int64   `json:"candidate_count"`
+	CompletedCount int64   `json:"completed_count"`
 }
 
 // SyncS is the durable synchronization lifecycle (§5.2).

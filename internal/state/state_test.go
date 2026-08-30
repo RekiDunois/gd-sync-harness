@@ -139,18 +139,59 @@ func TestManifestReplace(t *testing.T) {
 		{ProfileID: "p", RelPath: "a.md", Size: 1, ModTime: 10},
 		{ProfileID: "p", RelPath: "b/c.md", Size: 2, ModTime: 20},
 	}
-	if err := db.ManifestReplaceAll("p", entries); err != nil {
+	if err := db.ManifestApply("p", entries); err != nil {
 		t.Fatal(err)
 	}
 	n, _ := db.ManifestCount("p")
 	if n != 2 {
 		t.Fatalf("count = %d", n)
 	}
-	if err := db.ManifestReplaceAll("p", entries[:1]); err != nil {
+	if err := db.ManifestApply("p", entries[:1]); err != nil {
 		t.Fatal(err)
 	}
 	n, _ = db.ManifestCount("p")
 	if n != 1 {
 		t.Fatalf("replace should delete stale; count = %d", n)
+	}
+}
+
+// TestManifestApplyPreservesSuppressed verifies a full eligible scan cannot
+// erase suppressed ownership records (§10.3).
+func TestManifestApplyPreservesSuppressed(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.ManifestUpsert(ManifestEntry{ProfileID: "p", RelPath: "a.md", Size: 1, ModTime: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ManifestUpsert(ManifestEntry{ProfileID: "p", RelPath: "b.md", Size: 2, ModTime: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ManifestMarkSuppressed("p", "b.md", "hash-x", 5); err != nil {
+		t.Fatal(err)
+	}
+	// Apply only a.md; the suppressed b.md must survive.
+	if err := db.ManifestApply("p", []ManifestEntry{{ProfileID: "p", RelPath: "a.md", Size: 1, ModTime: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	sup, err := db.ManifestSuppressedCount("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sup != 1 {
+		t.Fatalf("suppressed count = %d, want 1", sup)
+	}
+	b, err := db.ManifestGet("p", "b.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.State != ManifestSuppressed || b.SuppressedPolicyHash == nil || *b.SuppressedPolicyHash != "hash-x" {
+		t.Fatalf("b.md = %+v", b)
+	}
+	// Reactivation clears provenance.
+	if err := db.ManifestReactivate("p", "b.md"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = db.ManifestGet("p", "b.md")
+	if b.State != ManifestActive || b.SuppressedPolicyHash != nil {
+		t.Fatalf("b.md after reactivate = %+v", b)
 	}
 }

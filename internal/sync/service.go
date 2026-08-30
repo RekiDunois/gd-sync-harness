@@ -8,6 +8,7 @@ import (
 
 	"knowledge-sync/internal/config"
 	"knowledge-sync/internal/exec"
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 )
 
@@ -54,18 +55,14 @@ func (s *Service) FastUpsert(ctx context.Context, p *state.Profile, files []stri
 	return nil
 }
 
-// sourceFilesFrom builds a files-from list containing exactly the eligible
-// source files under the structured filter (§10.1). It is used by both dry-run
-// and live full reconciliation so the mirror honors excludes/max-size and, with
-// sync semantics, removes previously-mirrored files that became excluded (§17).
-func (s *Service) sourceFilesFrom(p *state.Profile) (string, []string, error) {
-	scan, err := ScanLocal(p)
+// sourceFilesFromPolicy builds the active files-from list under an owned
+// committed policy snapshot (§11). The sync command uploads exactly these
+// paths; suppressed remote objects (absent from the list) are protected and
+// survive ordinary reconciliation.
+func (s *Service) sourceFilesFromPolicy(p *state.Profile, snap *policy.Snapshot) (string, []string, error) {
+	paths, err := ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {
 		return "", nil, err
-	}
-	paths := make([]string, 0, len(scan.Entries))
-	for _, e := range scan.Entries {
-		paths = append(paths, e.RelPath)
 	}
 	list, err := writeFilesFrom(paths)
 	if err != nil {
@@ -74,12 +71,13 @@ func (s *Service) sourceFilesFrom(p *state.Profile) (string, []string, error) {
 	return list, paths, nil
 }
 
-// DryRunSync performs rclone sync in dry-run mode to compute the destructive
-// plan without mutating the remote. It uses the structured-filter files-from
-// list so the plan reflects the true mirror semantics. rclone writes the
-// summary to stderr, so we combine stdout+stderr for parsing.
-func (s *Service) DryRunSync(ctx context.Context, p *state.Profile, options SyncOptions) (*PreflightResult, error) {
-	list, _, err := s.sourceFilesFrom(p)
+// DryRunSyncProtected performs the preflight dry-run against the owned policy
+// snapshot (§11.3). It lists active paths only (no --delete-excluded), so the
+// plan reflects uploads/updates plus any explicitly supplied proven-delete
+// count. rclone writes the summary to stderr, so we combine stdout+stderr for
+// parsing.
+func (s *Service) DryRunSyncProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, options SyncOptions) (*PreflightResult, error) {
+	list, _, err := s.sourceFilesFromPolicy(p, snap)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +87,6 @@ func (s *Service) DryRunSync(ctx context.Context, p *state.Profile, options Sync
 		"sync",
 		"--dry-run",
 		"--files-from", list,
-		"--delete-excluded",
 		"--fast-list",
 		"--track-renames",
 		p.SourcePath,
@@ -102,6 +99,47 @@ func (s *Service) DryRunSync(ctx context.Context, p *state.Profile, options Sync
 		return nil, fmt.Errorf("preflight dry-run: %w: %s", res.Err, res.StderrTrimmed())
 	}
 	return parseDryRun(string(res.Stdout) + "\n" + string(res.Stderr))
+}
+
+// FullSyncProtected runs the live non-destructive upload for the active set
+// under the owned policy snapshot (§11.3). Suppressed remote objects are not
+// in the files-from list and therefore survive. Proven deletions are applied
+// separately via DeleteRemotePaths after budget validation.
+func (s *Service) FullSyncProtected(ctx context.Context, p *state.Profile, snap *policy.Snapshot, options SyncOptions, onStats func(exec.ProgressStats)) (*PreflightResult, error) {
+	list, _, err := s.sourceFilesFromPolicy(p, snap)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(list)
+
+	args := []string{
+		"sync",
+		"--files-from", list,
+		"--fast-list",
+		"--track-renames",
+		p.SourcePath,
+		p.RemoteName + ":" + p.RemoteDisplayPath,
+	}
+	args = append(args[:len(args)-2], config.ArgsFor(config.Config{Rclone: s.RcloneConfig}, config.FullSync)...)
+	args = append(args, p.SourcePath, p.RemoteName+":"+p.RemoteDisplayPath)
+	res := s.Rclone.RunProgress(ctx, onStats, args...)
+	if res.Err != nil {
+		return nil, fmt.Errorf("full sync: %w: %s", res.Err, res.StderrTrimmed())
+	}
+	return &PreflightResult{}, nil
+}
+
+// DeleteRemotePaths removes the given remote paths one by one (targeted
+// deletion). It is used for proven ordinary local deletions within the delete
+// budget (§11.4). It never touches suppressed objects.
+func (s *Service) DeleteRemotePaths(ctx context.Context, p *state.Profile, paths []string) error {
+	for _, rel := range paths {
+		res := s.Rclone.Run(ctx, "deletefile", p.RemoteName+":"+p.RemoteDisplayPath+"/"+rel)
+		if res.Err != nil {
+			return fmt.Errorf("delete %s: %w: %s", rel, res.Err, res.StderrTrimmed())
+		}
+	}
+	return nil
 }
 
 // parseDryRun interprets the rclone sync summary output.
@@ -154,47 +192,6 @@ func parseLeadingInt(s string) (int, error) {
 	return sign * n, nil
 }
 
-// FullSync runs the live destructive reconciliation (§15). It uses the same
-// structured-filter files-from list as preflight so excludes and max-size are
-// enforced on the source side and excluded remote objects are removed (§17).
-func (s *Service) FullSync(ctx context.Context, p *state.Profile, options SyncOptions) error {
-	_, err := s.fullSync(ctx, p, options, nil)
-	return err
-}
-
-// FullSyncProgress is like FullSync but streams best-effort transfer progress
-// (§10.1). onStats may be nil.
-func (s *Service) FullSyncProgress(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats)) error {
-	_, err := s.fullSync(ctx, p, options, onStats)
-	return err
-}
-
-func (s *Service) fullSync(ctx context.Context, p *state.Profile, options SyncOptions, onStats func(exec.ProgressStats)) (*PreflightResult, error) {
-	list, _, err := s.sourceFilesFrom(p)
-	if err != nil {
-		return nil, err
-	}
-	defer os.Remove(list)
-
-	args := []string{
-		"sync",
-		"--files-from", list,
-		"--delete-excluded",
-		"--fast-list",
-		"--track-renames",
-		fmt.Sprintf("--max-delete=%d", effectiveDeleteLimit(p, options)),
-		p.SourcePath,
-		p.RemoteName + ":" + p.RemoteDisplayPath,
-	}
-	args = append(args[:len(args)-2], config.ArgsFor(config.Config{Rclone: s.RcloneConfig}, config.FullSync)...)
-	args = append(args, p.SourcePath, p.RemoteName+":"+p.RemoteDisplayPath)
-	res := s.Rclone.RunProgress(ctx, onStats, args...)
-	if res.Err != nil {
-		return nil, fmt.Errorf("full sync: %w: %s", res.Err, res.StderrTrimmed())
-	}
-	return &PreflightResult{}, nil
-}
-
 func effectiveDeleteLimit(p *state.Profile, o SyncOptions) int {
 	if o.AllowDeletes > 0 {
 		return o.AllowDeletes
@@ -203,10 +200,14 @@ func effectiveDeleteLimit(p *state.Profile, o SyncOptions) int {
 }
 
 // VerifyCheck runs `rclone check --one-way --size-only` (migration verification).
-// It applies the structured filter (§10.1) so excluded source files are not
-// reported as missing on the remote.
+// It lists the committed-policy active source files so excluded source files are
+// not reported as missing on the remote.
 func (s *Service) VerifyCheck(ctx context.Context, p *state.Profile) error {
-	list, _, err := s.sourceFilesFrom(p)
+	snap, err := loadCommittedSnapshot(s, p)
+	if err != nil {
+		return err
+	}
+	list, _, err := s.sourceFilesFromPolicy(p, snap)
 	if err != nil {
 		return err
 	}
@@ -228,9 +229,13 @@ func (s *Service) VerifyCheck(ctx context.Context, p *state.Profile) error {
 }
 
 // VerifyFull runs a full hash-level check (`rclone check --one-way`), §27.
-// It applies the structured filter (§10.1).
+// It lists the committed-policy active source files.
 func (s *Service) VerifyFull(ctx context.Context, p *state.Profile) error {
-	list, _, err := s.sourceFilesFrom(p)
+	snap, err := loadCommittedSnapshot(s, p)
+	if err != nil {
+		return err
+	}
+	list, _, err := s.sourceFilesFromPolicy(p, snap)
 	if err != nil {
 		return err
 	}
@@ -249,4 +254,17 @@ func (s *Service) VerifyFull(ctx context.Context, p *state.Profile) error {
 		return fmt.Errorf("verify full: %w: %s", res.Err, res.StderrTrimmed())
 	}
 	return nil
+}
+
+// loadCommittedSnapshot reads the committed policy snapshot for a profile,
+// treating a missing policy as a safe empty gitignore snapshot.
+func loadCommittedSnapshot(s *Service, p *state.Profile) (*policy.Snapshot, error) {
+	snap, err := s.DB.GetCommittedSnapshot(p.ID)
+	if err != nil {
+		return nil, err
+	}
+	if snap == nil {
+		return &policy.Snapshot{}, nil
+	}
+	return snap, nil
 }

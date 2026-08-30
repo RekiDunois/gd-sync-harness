@@ -178,3 +178,56 @@ func TestWatcherDeleteRequestsReconcile(t *testing.T) {
 		t.Error("expected durable full debt after delete")
 	}
 }
+
+// TestWatcherDoesNotDropStalePolicyEvents verifies the watcher records events
+// even for paths that an older policy snapshot would have ignored (§1.3,
+// §12.2). A committed policy change that makes a formerly-ignored path eligible
+// must never lose future events at the watcher boundary.
+func TestWatcherDoesNotDropStalePolicyEvents(t *testing.T) {
+	db := openTestState(t)
+	src := t.TempDir()
+	if err := db.CreateProfile(&state.Profile{ID: "p2", ProfileUUID: "u2", Type: "generic", SourcePath: src, RemoteName: "example-remote", RemoteFolderID: "f2", RemoteDisplayPath: "mirror", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE profile_sync_state SET initialized_at = '2026-01-01T00:00:00.000Z', last_success_generation = 1, desired_generation = 1, state = 'ready' WHERE profile_id = 'p2'`); err != nil {
+		t.Fatal(err)
+	}
+	// A formerly-ignored path (e.g. under "Private/" in an old policy) is now
+	// eligible under the newly committed policy. The watcher must record the
+	// event regardless of any stale policy cache.
+	file := filepath.Join(src, "Private", "now-eligible.md")
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := fakeFSWatch(t, []string{file}, EventUpdated|EventIsFile)
+	lg := log.New(io.Discard, "", 0)
+	w := &Watcher{
+		ProfileID: "p2", SourcePath: src, FSWatchBin: fake, DB: db, Log: lg,
+		Settings: DefaultFastSettings(),
+		// Simulate a stale policy cache that would previously drop this path.
+		Filter: nil,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := w.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Give the debouncer time to fire the batch.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		n, _ := db.CountPending("p2")
+		if n > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	_ = w.Stop()
+	n, _ := db.CountPending("p2")
+	if n == 0 {
+		t.Fatal("watcher must record events for formerly-ignored paths (stale policy must not drop facts)")
+	}
+}

@@ -199,11 +199,11 @@ func (w *Watcher) handleEvent(ctx context.Context, path string, flags uint64) {
 }
 
 func (w *Watcher) classify(path, rel string, flags uint64) string {
-	if w.Filter != nil {
-		if excluded, _ := w.Filter.Excluded(rel); excluded {
-			return ""
-		}
-	}
+	// The watcher is a durable fact producer, not the eligibility authority
+	// (§12.1). Path-policy filtering at this boundary would permanently lose
+	// events after a committed policy change makes a formerly ignored path
+	// eligible (§1.3, §12.2). The worker applies the committed matcher to
+	// durable events under its owned snapshot.
 	if flags == 0 || flags&EventOverflow != 0 || flags&EventPlatformSpecific != 0 {
 		return state.EventOther
 	}

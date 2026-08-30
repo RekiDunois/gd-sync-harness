@@ -26,7 +26,16 @@ func Open(path string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
-	return &DB{DB: db}, nil
+	d := &DB{DB: db}
+	// Backfill durable ignore policy for profiles created before the policy
+	// model existed (§6.2). Structured legacy excludes are converted into a
+	// synthetic gitignore snapshot; profiles without excludes get a safe empty
+	// gitignore policy.
+	if err := d.backfillPolicyRows(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("backfill ignore policy: %w", err)
+	}
+	return d, nil
 }
 
 // Close closes the underlying database.

@@ -100,6 +100,25 @@ func renderStatusSnapshot(s *live.StatusSnapshot) error {
 		fmt.Fprintf(out(), "Last error: %s\n", *s.Sync.LastError)
 	}
 
+	if s.Policy != nil {
+		fmt.Fprintf(out(), "Policy:  %s (%s)\n", s.Policy.PolicyHash, s.Policy.Source)
+		fmt.Fprintf(out(), "  refresh:   %s\n", s.Policy.RefreshState)
+		if s.Policy.SuppressedCount > 0 {
+			fmt.Fprintf(out(), "  suppressed: %d\n", s.Policy.SuppressedCount)
+		}
+	}
+	if s.Prune != nil {
+		rid := ""
+		if s.Prune.RequestID != nil {
+			rid = *s.Prune.RequestID
+		}
+		st := ""
+		if s.Prune.State != nil {
+			st = *s.Prune.State
+		}
+		fmt.Fprintf(out(), "Prune:  #%s (%s, %d/%d done)\n", rid, st, s.Prune.CompletedCount, s.Prune.CandidateCount)
+	}
+
 	if act := s.Activity; act != nil {
 		runID := ""
 		if act.RunID != nil {
@@ -251,8 +270,28 @@ func renderProfileSyncStatusDB(app *App, id string) error {
 			fmt.Fprintf(out(), "Last heartbeat: %s ago\n", humanDuration(time.Since(t)))
 		}
 	}
+	renderPolicyPruneSummary(app, id)
 	fmt.Fprintln(out(), "(live worker telemetry unavailable; showing durable state)")
 	return nil
+}
+
+// renderPolicyPruneSummary prints the durable policy/prune summary for both the
+// live and SQLite-fallback status paths (§16.1).
+func renderPolicyPruneSummary(app *App, id string) {
+	pol, _ := app.DB.GetCommittedPolicy(id)
+	if pol != nil {
+		fmt.Fprintf(out(), "Policy:  %s (%s)\n", pol.PolicyHash, pol.PolicySource)
+		fmt.Fprintf(out(), "  refresh:   %s\n", pol.RefreshState)
+		sup, _ := app.DB.ManifestSuppressedCount(id)
+		if sup > 0 {
+			fmt.Fprintf(out(), "  suppressed: %d\n", sup)
+		}
+	}
+	req, _ := app.DB.GetActivePruneRequest(id)
+	if req != nil {
+		fmt.Fprintf(out(), "Prune:  #%s (%s, %d/%d done)\n", req.RequestID, req.State,
+			req.DeletedCount+req.MissingCount, req.CandidateCount)
+	}
 }
 
 func currentRun(app *App, id string, ss *state.ProfileSyncState) *state.SyncRun {

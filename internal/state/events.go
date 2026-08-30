@@ -23,6 +23,11 @@ type PendingEvent struct {
 	FirstSeen        string `json:"first_seen"`
 	LastSeen         string `json:"last_seen"`
 	SourceGeneration int64  `json:"source_generation"`
+	// Policy context recorded durably with the event for delete-vs-suppress
+	// classification (§9.2).
+	ObservedPolicyHash *string `json:"observed_policy_hash,omitempty"`
+	ObservedPolicyGen  *int64  `json:"observed_policy_generation,omitempty"`
+	PolicyContextKnown bool    `json:"policy_context_known"`
 }
 
 // UpsertPendingEvent inserts or bumps last_seen for an existing event.
@@ -46,7 +51,19 @@ func (d *DB) UpsertDeleteEvent(profileID, path string, generation int64) error {
 // RecordEvent atomically advances the source generation and records either a
 // detailed fast event or a collapsed full-reconcile intent. This closes the
 // crash window between bumping a generation and persisting its consequence.
+// The current committed policy hash/generation is captured with the event so
+// delete-vs-suppress classification has durable ordering evidence (§9.2).
 func (d *DB) RecordEvent(profileID, path, kind string, full bool) (int64, error) {
+	return d.recordEvent(profileID, path, kind, full, "")
+}
+
+// RecordEventWithPolicy is RecordEvent with an explicit committed policy hash
+// captured at call time (the caller may already hold the committed policy).
+func (d *DB) RecordEventWithPolicy(profileID, path, kind string, full bool, policyHash string) (int64, error) {
+	return d.recordEvent(profileID, path, kind, full, policyHash)
+}
+
+func (d *DB) recordEvent(profileID, path, kind string, full bool, policyHash string) (int64, error) {
 	tx, err := d.Begin()
 	if err != nil {
 		return 0, err
@@ -65,6 +82,32 @@ func (d *DB) RecordEvent(profileID, path, kind string, full bool) (int64, error)
 	if err := tx.QueryRow(`SELECT desired_generation, last_success_generation, current_run_id FROM profile_sync_state WHERE profile_id = ?`, profileID).
 		Scan(&desired, &last, &current); err != nil {
 		return 0, err
+	}
+	// Capture the current committed policy context if the caller did not
+	// supply one explicitly.
+	observedHash := policyHash
+	observedGen := sql.NullInt64{}
+	policyKnown := false
+	if observedHash == "" {
+		if err := tx.QueryRow(`SELECT policy_hash, committed_generation FROM profile_ignore_policy WHERE profile_id = ?`, profileID).
+			Scan(&observedHash, &observedGen); err == nil {
+			policyKnown = true
+		}
+	} else {
+		if err := tx.QueryRow(`SELECT committed_generation FROM profile_ignore_policy WHERE profile_id = ?`, profileID).
+			Scan(&observedGen); err == nil {
+			policyKnown = true
+		}
+	}
+	var hashArg interface{}
+	var genArg interface{}
+	if policyKnown {
+		hashArg = observedHash
+		genArg = observedGen.Int64
+	}
+	knownArg := 0
+	if policyKnown {
+		knownArg = 1
 	}
 	if full || !last.Valid || desired > last.Int64 || current.Valid {
 		now := Now()
@@ -85,11 +128,15 @@ func (d *DB) RecordEvent(profileID, path, kind string, full bool) (int64, error)
 		}
 	} else {
 		now := Now().Format(timeFmt)
-		if _, err := tx.Exec(`INSERT INTO pending_events (profile_id, path, event_kind, first_seen, last_seen, source_generation)
-			VALUES (?, ?, ?, ?, ?, ?)
+		if _, err := tx.Exec(`INSERT INTO pending_events (profile_id, path, event_kind, first_seen, last_seen, source_generation,
+			observed_policy_hash, observed_policy_generation, policy_context_known)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (profile_id, path) DO UPDATE SET event_kind = excluded.event_kind,
-			last_seen = excluded.last_seen, source_generation = MAX(pending_events.source_generation, excluded.source_generation)`,
-			profileID, path, kind, now, now, generation); err != nil {
+			last_seen = excluded.last_seen, source_generation = MAX(pending_events.source_generation, excluded.source_generation),
+			observed_policy_hash = excluded.observed_policy_hash,
+			observed_policy_generation = excluded.observed_policy_generation,
+			policy_context_known = excluded.policy_context_known`,
+			profileID, path, kind, now, now, generation, hashArg, genArg, knownArg); err != nil {
 			return 0, err
 		}
 	}
@@ -101,7 +148,8 @@ func (d *DB) RecordEvent(profileID, path, kind string, full bool) (int64, error)
 
 // ListPending returns all pending events for a profile ordered by first_seen.
 func (d *DB) ListPending(profileID string) ([]PendingEvent, error) {
-	rows, err := d.Query(`SELECT id, profile_id, path, event_kind, first_seen, last_seen, source_generation
+	rows, err := d.Query(`SELECT id, profile_id, path, event_kind, first_seen, last_seen, source_generation,
+		observed_policy_hash, observed_policy_generation, policy_context_known
 		FROM pending_events WHERE profile_id = ? ORDER BY first_seen`, profileID)
 	if err != nil {
 		return nil, err
@@ -110,9 +158,19 @@ func (d *DB) ListPending(profileID string) ([]PendingEvent, error) {
 	var out []PendingEvent
 	for rows.Next() {
 		var e PendingEvent
-		if err := rows.Scan(&e.ID, &e.ProfileID, &e.Path, &e.EventKind, &e.FirstSeen, &e.LastSeen, &e.SourceGeneration); err != nil {
+		var hash sql.NullString
+		var gen sql.NullInt64
+		var known int
+		if err := rows.Scan(&e.ID, &e.ProfileID, &e.Path, &e.EventKind, &e.FirstSeen, &e.LastSeen,
+			&e.SourceGeneration, &hash, &gen, &known); err != nil {
 			return nil, err
 		}
+		e.ObservedPolicyHash = nullStr(hash)
+		if gen.Valid {
+			v := gen.Int64
+			e.ObservedPolicyGen = &v
+		}
+		e.PolicyContextKnown = known == 1
 		out = append(out, e)
 	}
 	return out, rows.Err()

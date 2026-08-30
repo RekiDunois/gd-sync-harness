@@ -9,8 +9,8 @@ import (
 
 // buildPreV8DB constructs a database at schema v7 (pre-v8) with the real column
 // set, so the v8 migration is exercised against genuine legacy data. We derive
-// it by migrating a fresh DB to v7 then stopping — the simplest faithful
-// representation of the pre-change schema.
+// it by migrating a fresh DB to the latest version then rolling back all v8/v9
+// additions — the simplest faithful representation of the pre-change schema.
 func buildPreV8DB(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "prev8.sqlite")
@@ -18,15 +18,9 @@ func buildPreV8DB(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Roll the schema back to v7 by removing the v8 migration record. The v8
-	// columns were added; drop them to truly represent the pre-v8 schema.
-	if _, err := fresh.Exec(`DELETE FROM schema_migrations WHERE version = 8`); err != nil {
-		t.Fatal(err)
-	}
-	// Reconstruct a v7 state table by creating a fresh v7-only DB in SQL is
-	// complex; instead assert the v8 upgrade runs on a v7-marked DB by
-	// re-opening (which will re-apply v8). To keep it a genuine pre-v8 schema we
-	// drop the v8 columns first.
+	// Roll the schema back to v7: drop the v8 intent columns and all v9
+	// policy/prune/ledger additions, then remove their migration records so a
+	// re-open re-applies them.
 	for _, col := range []string{
 		"pending_manual_generation", "pending_manual_allow_deletes", "pending_manual_bypass_debounce",
 	} {
@@ -36,6 +30,27 @@ func buildPreV8DB(t *testing.T) string {
 	}
 	for _, col := range []string{"effective_max_delete", "manual_delete_override"} {
 		if _, err := fresh.Exec(`ALTER TABLE sync_runs DROP COLUMN ` + col); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, col := range []string{"state", "suppressed_policy_hash", "suppressed_generation"} {
+		if _, err := fresh.Exec(`ALTER TABLE manifest DROP COLUMN ` + col); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, col := range []string{"observed_policy_hash", "observed_policy_generation", "policy_context_known"} {
+		if _, err := fresh.Exec(`ALTER TABLE pending_events DROP COLUMN ` + col); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS prune_targets`,
+		`DROP TABLE IF EXISTS prune_requests`,
+		`DROP TABLE IF EXISTS profile_ignore_snapshot_files`,
+		`DROP TABLE IF EXISTS profile_ignore_policy`,
+		`DELETE FROM schema_migrations WHERE version IN (8, 9)`,
+	} {
+		if _, err := fresh.Exec(q); err != nil {
 			t.Fatal(err)
 		}
 	}

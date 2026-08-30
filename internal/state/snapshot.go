@@ -10,6 +10,8 @@ type DurableSnapshot struct {
 	SyncState  *ProfileSyncState
 	CurrentRun *SyncRun
 	Runtime    *Runtime
+	Policy     *CommittedPolicy
+	Prune      *PruneRequest
 }
 
 // LoadDurableSnapshot reads the durable state for a profile in one call. It
@@ -35,5 +37,7 @@ func (d *DB) LoadDurableSnapshot(profileID string) (*DurableSnapshot, error) {
 		run, _ = d.GetRun(*ss.CurrentRunID)
 	}
 	rt, _ := d.GetRuntime(profileID)
-	return &DurableSnapshot{Profile: p, SyncState: ss, CurrentRun: run, Runtime: rt}, nil
+	pol, _ := d.GetCommittedPolicy(profileID)
+	prune, _ := d.GetActivePruneRequest(profileID)
+	return &DurableSnapshot{Profile: p, SyncState: ss, CurrentRun: run, Runtime: rt, Policy: pol, Prune: prune}, nil
 }

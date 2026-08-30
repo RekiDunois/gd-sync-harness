@@ -76,7 +76,8 @@ func newReconcileNowCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().IntVar(&allowDeletes, "allow-deletes", 0, "one-shot delete budget override (§16)")
+	c.Flags().IntVar(&allowDeletes, "allow-deletes", 0,
+		"one reconcile attempt's ordinary deletion budget (distinct from `prune execute --allow-deletes`, which is a durable ceiling for one immutable suppressed-object request)")
 	return c
 }
 

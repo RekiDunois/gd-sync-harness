@@ -3,6 +3,7 @@ module knowledge-sync
 go 1.26.7
 
 require (
+	github.com/git-pkgs/gitignore v1.2.0
 	github.com/spf13/cobra v1.9.1
 	modernc.org/sqlite v1.57.0
 )

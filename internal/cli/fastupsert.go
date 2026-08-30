@@ -8,6 +8,7 @@ import (
 
 	"knowledge-sync/internal/filter"
 	"knowledge-sync/internal/live"
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 )
 
@@ -22,14 +23,30 @@ var fastSettings = struct {
 
 // runFastUpsertBatch evaluates the durable pending-event queue for a profile
 // and executes a due fast upsert when no full-reconciliation debt exists
-// (§13.2, §13.3). The caller holds the profile lock and remote lease.
+// (§13.2, §13.3). The caller holds the profile lock and remote lease. It loads
+// the committed policy snapshot so eligibility rechecks use the owned durable
+// policy (§12.3).
 func runFastUpsertBatch(ctx context.Context, app *App, p *state.Profile, lg *log.Logger) error {
-	return runFastUpsertBatchAt(ctx, app, p, lg, time.Now(), fastSettings)
+	snap, err := app.DB.GetCommittedSnapshot(p.ID)
+	if err != nil {
+		return err
+	}
+	if snap == nil {
+		snap = &policy.Snapshot{}
+	}
+	return runFastUpsertBatchOwned(ctx, app, p, snap, lg)
+}
+
+// runFastUpsertBatchOwned is the worker-owned fast batch under the committed
+// policy snapshot (§12.3). Successful fast uploads upsert the managed ledger
+// active row before clearing the exact pending event versions (§10.4).
+func runFastUpsertBatchOwned(ctx context.Context, app *App, p *state.Profile, snap *policy.Snapshot, lg *log.Logger) error {
+	return runFastUpsertBatchAt(ctx, app, p, snap, lg, time.Now(), fastSettings)
 }
 
 // runFastUpsertBatchAt is runFastUpsertBatch with an injectable clock and
 // settings for deterministic tests.
-func runFastUpsertBatchAt(ctx context.Context, app *App, p *state.Profile, lg *log.Logger, now time.Time, settings struct {
+func runFastUpsertBatchAt(ctx context.Context, app *App, p *state.Profile, snap *policy.Snapshot, lg *log.Logger, now time.Time, settings struct {
 	SettleSeconds   int
 	MaxDelaySeconds int
 }) error {
@@ -91,16 +108,15 @@ func runFastUpsertBatchAt(ctx context.Context, app *App, p *state.Profile, lg *l
 		return nil
 	}
 
-	// Recheck eligibility per event (the source file must still exist and be
-	// within the structured filter).
-	f := filter.FromProfile(p)
+	// Recheck eligibility per event using the committed policy matcher (§12.3).
+	eng := filter.FromPolicy(p.ID, p.MaxFileSize, snap)
 	var eligible []state.PendingEvent
 	for _, e := range pending {
 		if e.EventKind == state.EventModify || e.EventKind == state.EventCreate {
 			if _, err := os.Stat(joinSource(p.SourcePath, e.Path)); err != nil {
 				continue
 			}
-			if excluded, _ := f.Excluded(e.Path); excluded {
+			if excluded, _ := eng.ExcludedDir(e.Path, false); excluded {
 				continue
 			}
 		}
@@ -133,6 +149,23 @@ func runFastUpsertBatchAt(ctx context.Context, app *App, p *state.Profile, lg *l
 		// idempotently (§13.4, failure mode).
 		_ = app.DB.SetLastError(p.ID, err.Error())
 		return err
+	}
+	// Ledger barrier (§10.4): record durable managed ownership BEFORE clearing
+	// the exact event versions. A crash between upload and ledger upsert leaves
+	// the event pending so a retry repairs the ledger idempotently.
+	for _, rel := range paths {
+		if _, err := os.Stat(joinSource(p.SourcePath, rel)); err != nil {
+			continue
+		}
+		fi, err := os.Stat(joinSource(p.SourcePath, rel))
+		if err != nil {
+			continue
+		}
+		if err := app.DB.ManifestUpsert(state.ManifestEntry{
+			ProfileID: p.ID, RelPath: rel, Size: fi.Size(), ModTime: fi.ModTime().Unix(),
+		}); err != nil {
+			return err
+		}
 	}
 	// Clear only the exact event versions included in the batch; newer
 	// same-path events survive (§13.4).

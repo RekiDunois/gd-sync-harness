@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"knowledge-sync/internal/filter"
 	"knowledge-sync/internal/logger"
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 	"knowledge-sync/internal/sync"
 	"knowledge-sync/internal/watch"
@@ -57,7 +57,10 @@ func runWatcher(app *App, p *state.Profile) error {
 		DB:         app.DB,
 		Log:        lg,
 		Settings:   watch.DefaultFastSettings(),
-		Filter:     filter.FromProfile(p),
+		// No stale startup filter is set: the watcher is a fact producer and
+		// must never drop events because they match a policy older than the
+		// currently committed hash (§1.3, §12.2). The worker applies the
+		// committed matcher to durable events.
 		// The watcher is an event/intent producer only (§13.1): it records
 		// durable events and wakes the worker, which owns fast-upsert
 		// execution. The debounce deadline is evaluated by the worker from
@@ -106,13 +109,28 @@ func runWatcher(app *App, p *state.Profile) error {
 	return nil
 }
 
-// runWatcherCatchUp compares the current local manifest with the last durable
+// runWatcherCatchUp compares the current local source against the last durable
 // manifest after fswatch is live, recovering changes made while the watcher
 // was stopped without materializing a large initial pending queue.
 func runWatcherCatchUp(ctx context.Context, app *App, p *state.Profile) error {
-	scan, err := sync.ScanLocal(p)
+	snap, err := app.DB.GetCommittedSnapshot(p.ID)
 	if err != nil {
 		return err
+	}
+	if snap == nil {
+		snap = &policy.Snapshot{}
+	}
+	active, err := sync.ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
+	if err != nil {
+		return err
+	}
+	scan := &sync.ScanResult{}
+	for _, rel := range active {
+		fi, err := os.Stat(joinSource(p.SourcePath, rel))
+		if err != nil {
+			continue
+		}
+		scan.Entries = append(scan.Entries, sync.ScanEntry{RelPath: rel, Size: fi.Size(), ModTime: fi.ModTime().Unix()})
 	}
 	manifest, err := app.DB.ManifestAll(p.ID)
 	if err != nil {

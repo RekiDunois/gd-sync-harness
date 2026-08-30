@@ -5,16 +5,28 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/git-pkgs/gitignore"
+
+	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 )
 
-// Engine evaluates the structured filter model (§10.1). The same Engine
-// instance is used by the watcher, local manifest scans, fast-path file lists,
-// and full rclone reconciliation so semantics never split.
+// Engine evaluates path eligibility (§3). In the target model the engine wraps
+// the committed Gitignore policy snapshot's matcher; legacy structured rules
+// remain only as migration inputs until Phase 2 converts them into a synthetic
+// Gitignore snapshot.
+//
+// Non-path eligibility (max_file_size, symlink handling) remains a separate
+// check on the Engine and is never encoded as fake .gitignore rules (§3.3).
 type Engine struct {
 	ProfileID   string
 	MaxFileSize int64 // 0 = unlimited
-	rules       []rule
+	// matcher is the committed-policy Gitignore matcher, or nil when the
+	// engine is built from legacy structured excludes.
+	matcher  *gitignore.Matcher
+	warnings []policy.PatternWarning
+	// legacy rules are the structured migration-input rules.
+	legacy []rule
 }
 
 type rule struct {
@@ -22,7 +34,10 @@ type rule struct {
 	value string
 }
 
-// New builds an Engine from a profile and its excludes.
+// New builds an Engine from a profile and its excludes. The excludes are the
+// legacy structured migration input; a profile without structured excludes gets
+// a nil matcher (no path exclusions). The policy snapshot is attached via
+// FromPolicy.
 func New(profileID string, maxFileSize int64, excludes []string) *Engine {
 	e := &Engine{ProfileID: profileID, MaxFileSize: maxFileSize}
 	for _, ex := range excludes {
@@ -31,21 +46,36 @@ func New(profileID string, maxFileSize int64, excludes []string) *Engine {
 	return e
 }
 
-// FromProfile builds an Engine from a state.Profile.
+// FromProfile builds an Engine from a state.Profile (legacy structured rules).
 func FromProfile(p *state.Profile) *Engine {
 	return New(p.ID, p.MaxFileSize, p.Excludes)
 }
 
+// FromPolicy builds an Engine from a committed policy snapshot. The snapshot's
+// matcher is constructed from repository-local .gitignore bytes only (§3.1).
+func FromPolicy(profileID string, maxFileSize int64, snap *policy.Snapshot) *Engine {
+	e := &Engine{ProfileID: profileID, MaxFileSize: maxFileSize}
+	if snap != nil {
+		m := snap.Matcher()
+		e.matcher = m
+		e.warnings = policy.MatcherWarnings(m)
+	}
+	return e
+}
+
+// Warnings returns the matcher's invalid-pattern warnings (§3.4).
+func (e *Engine) Warnings() []policy.PatternWarning { return e.warnings }
+
 func (e *Engine) addRaw(raw string) {
 	idx := strings.Index(raw, ":")
 	if idx <= 0 {
-		e.rules = append(e.rules, rule{kind: state.RuleExcludePathPrefix, value: raw})
+		e.legacy = append(e.legacy, rule{kind: state.RuleExcludePathPrefix, value: raw})
 		return
 	}
 	kind, val := raw[:idx], raw[idx+1:]
 	switch kind {
 	case state.RuleExcludePathPrefix, state.RuleExcludeDirName, state.RuleExcludeFileName, state.RuleExcludeExtension:
-		e.rules = append(e.rules, rule{kind: kind, value: strings.TrimSpace(val)})
+		e.legacy = append(e.legacy, rule{kind: kind, value: strings.TrimSpace(val)})
 	}
 }
 
@@ -63,17 +93,36 @@ func NormalizeRelPath(sourceRoot, absPath string) string {
 	return rel
 }
 
-// Excluded reports whether a relative path (slash-separated) should be excluded.
-func (e *Engine) Excluded(relPath string) (bool, string) {
+// ExcludedDir reports whether a relative path (slash-separated) should be
+// excluded given a real file-vs-directory identity (§3.2). The Gitignore
+// matcher is authoritative when present; otherwise legacy structured rules
+// apply.
+func (e *Engine) ExcludedDir(relPath string, isDir bool) (bool, string) {
 	if relPath == "" || relPath == "." {
 		return true, "root"
 	}
 	norm := filepath.ToSlash(relPath)
+	if e.matcher != nil {
+		return e.matcher.MatchPath(norm, isDir), "gitignore"
+	}
+	return e.legacyExcluded(norm, isDir)
+}
+
+// Excluded reports whether a relative path should be excluded. It is kept for
+// call sites that do not know the file-vs-directory identity and for legacy
+// compatibility; it treats candidate paths as non-directory unless the path
+// itself ends with a slash. New call sites with directory knowledge should use
+// ExcludedDir.
+func (e *Engine) Excluded(relPath string) (bool, string) {
+	return e.ExcludedDir(relPath, strings.HasSuffix(filepath.ToSlash(relPath), "/"))
+}
+
+func (e *Engine) legacyExcluded(norm string, isDir bool) (bool, string) {
 	parts := strings.Split(norm, "/")
 	fileName := parts[len(parts)-1]
 	ext := strings.ToLower(filepath.Ext(fileName))
 
-	for _, r := range e.rules {
+	for _, r := range e.legacy {
 		switch r.kind {
 		case state.RuleExcludePathPrefix:
 			p := strings.TrimPrefix(filepath.ToSlash(r.value), "/")

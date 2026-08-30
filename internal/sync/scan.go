@@ -64,12 +64,12 @@ func ScanLocalProgress(p *state.Profile, onProgress func(ScanProgress)) (*ScanRe
 			return nil
 		}
 		if info.IsDir() {
-			if excluded, _ := eng.Excluded(rel); excluded {
+			if excluded, _ := eng.ExcludedDir(rel, true); excluded {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if excluded, _ := eng.Excluded(rel); excluded {
+		if excluded, _ := eng.ExcludedDir(rel, false); excluded {
 			return nil
 		}
 		if filter.IsSymlink(path) {
