@@ -48,6 +48,11 @@ type App struct {
 	LogDir     string
 	LockDir    string
 	Config     config.Config
+
+	// LaunchAgentsDir overrides the launchd plist directory. It is empty in
+	// production (resolved via paths.LaunchAgentsDir); tests inject a temp dir
+	// so job install/uninstall never touches the real user agent directory.
+	LaunchAgentsDir string
 }
 
 // Context returns a cancellable lifecycle context. Long data-plane operations

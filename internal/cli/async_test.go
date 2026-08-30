@@ -49,6 +49,15 @@ func asyncTestApp(t *testing.T) (*App, string) {
 		DB: db, Rclone: r,
 		Sync: sync.New(r, db), Reconciler: sync.NewReconciler(sync.New(r, db)),
 		Remote: remote.New(r, db), LockDir: filepath.Join(t.TempDir(), "locks"),
+		// Isolate launchd job install/uninstall from the real user agent dir;
+		// production uses paths.LaunchAgentsDir, tests must never touch it.
+		LaunchAgentsDir: t.TempDir(),
+	}
+	// Point the worker socket at a per-test temp path so wait/observer tests
+	// never connect to a real worker listening on the default socket. The path
+	// does not exist, so socket-first observers cleanly fall back to SQLite.
+	if err := app.DB.SetSetting(state.SettingWorkerSocketPath, filepath.Join(t.TempDir(), "worker.sock")); err != nil {
+		t.Fatal(err)
 	}
 	return app, remoteRoot
 }

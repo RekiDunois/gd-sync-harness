@@ -14,6 +14,12 @@ func TestConfigSocketPathSetGetUnset(t *testing.T) {
 	app, _ := asyncTestApp(t)
 	p := asyncTestProfile(t, app, "cfg-sock")
 
+	// asyncTestApp sets an isolated temp socket path; clear it so this test
+	// exercises the unset -> default resolution order it owns.
+	if err := app.DB.UnsetSetting(state.SettingWorkerSocketPath); err != nil {
+		t.Fatal(err)
+	}
+
 	// get with no override → default.
 	configured, _ := app.DB.GetSetting(state.SettingWorkerSocketPath)
 	if configured != "" {
@@ -46,7 +52,7 @@ func TestConfigSocketPathSetGetUnset(t *testing.T) {
 	}
 
 	// The worker job detection against a real plist (best-effort).
-	if workerJobInstalled() {
+	if workerJobInstalled(app) {
 		t.Log("managed worker job present; config restart path will reload it")
 	}
 	_ = p

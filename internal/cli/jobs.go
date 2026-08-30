@@ -64,8 +64,21 @@ func mustSelfPath() string {
 	return exe
 }
 
+// launchAgentsDir resolves the plist directory, honoring the test injection
+// point on App. Production uses the real user LaunchAgents dir.
+func launchAgentsDir(app *App) string {
+	if app != nil && app.LaunchAgentsDir != "" {
+		return app.LaunchAgentsDir
+	}
+	dir, err := paths.LaunchAgentsDir()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
 func installJobs(app *App, p *state.Profile) error {
-	agentsDir, _ := paths.LaunchAgentsDir()
+	agentsDir := launchAgentsDir(app)
 	for _, cfg := range jobConfigs(app, p) {
 		if err := cfg.Reload(agentsDir); err != nil {
 			return fmt.Errorf("load %s: %w", cfg.Label(), err)
@@ -75,7 +88,7 @@ func installJobs(app *App, p *state.Profile) error {
 }
 
 func uninstallJobs(app *App, profileID string) error {
-	agentsDir, _ := paths.LaunchAgentsDir()
+	agentsDir := launchAgentsDir(app)
 	cfgs := []launchd.Config{
 		{LabelPrefix: launchLabelPrefix, ProfileID: profileID, Kind: launchd.JobWatch},
 		{LabelPrefix: launchLabelPrefix, ProfileID: profileID, Kind: launchd.JobReconcile},
@@ -107,7 +120,7 @@ func stopJobs(app *App, profileID string) error {
 
 // installWorkerJob installs and loads the global worker job.
 func installWorkerJob(app *App) error {
-	agentsDir, _ := paths.LaunchAgentsDir()
+	agentsDir := launchAgentsDir(app)
 	cfg := workerConfig(app)
 	if err := cfg.Reload(agentsDir); err != nil {
 		return fmt.Errorf("load %s: %w", cfg.Label(), err)
@@ -124,7 +137,7 @@ func ensureWorkerJob(app *App) error {
 
 // uninstallWorkerJob removes the global worker job.
 func uninstallWorkerJob(app *App) error {
-	agentsDir, _ := paths.LaunchAgentsDir()
+	agentsDir := launchAgentsDir(app)
 	cfg := workerConfig(app)
 	return cfg.Uninstall(agentsDir)
 }

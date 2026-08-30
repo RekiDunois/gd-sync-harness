@@ -9,7 +9,6 @@ import (
 
 	"knowledge-sync/internal/launchd"
 	"knowledge-sync/internal/live"
-	"knowledge-sync/internal/paths"
 	"knowledge-sync/internal/state"
 )
 
@@ -122,7 +121,7 @@ func configUnsetCmd() *cobra.Command {
 // is installed. Without a managed worker the new value takes effect on the next
 // worker start (§15.3).
 func restartManagedWorker(app *App) error {
-	if !workerJobInstalled() {
+	if !workerJobInstalled(app) {
 		fmt.Println("no managed worker job installed; the new value takes effect on the next worker start")
 		return nil
 	}
@@ -134,12 +133,12 @@ func restartManagedWorker(app *App) error {
 }
 
 // workerJobInstalled reports whether the global worker launchd plist exists.
-func workerJobInstalled() bool {
-	agentsDir, err := paths.LaunchAgentsDir()
-	if err != nil {
+func workerJobInstalled(app *App) bool {
+	agentsDir := launchAgentsDir(app)
+	if agentsDir == "" {
 		return false
 	}
 	cfg := launchd.Config{LabelPrefix: launchLabelPrefix, Kind: launchd.JobWorker, Binary: mustSelfPath()}
-	_, err = os.Stat(cfg.PlistPath(agentsDir))
+	_, err := os.Stat(cfg.PlistPath(agentsDir))
 	return err == nil
 }
