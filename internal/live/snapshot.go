@@ -61,25 +61,28 @@ type SyncS struct {
 
 // ActivityS is the ephemeral live activity state (§5.2, §6.2).
 type ActivityS struct {
-	Kind                     string    `json:"kind"`
-	RunID                    *string   `json:"run_id,omitempty"`
-	Phase                    string    `json:"phase"`
-	FilesCompleted           int64     `json:"files_completed"`
-	FilesTotal               int64     `json:"files_total"`
-	BytesCompleted           int64     `json:"bytes_completed"`
-	BytesTotal               int64     `json:"bytes_total"`
-	ChecksCompleted          int64     `json:"checks_completed"`
-	ChecksTotal              int64     `json:"checks_total"`
-	ItemsListed              int64     `json:"items_listed"`
-	ErrorsCount              int64     `json:"errors_count"`
-	CurrentItem              string    `json:"current_item,omitempty"`
-	CurrentItemBytes         int64     `json:"current_item_bytes"`
-	CurrentItemSize          int64     `json:"current_item_size"`
-	SpeedKnown               bool      `json:"speed_known"`
-	SpeedBytesPerSecond      float64   `json:"speed_bytes_per_second"`
-	LastMeasurableProgressAt time.Time `json:"last_measurable_progress_at,omitempty"`
-	PossibleStall            bool      `json:"possible_stall"`
-	ActiveTransfers          int64     `json:"active_transfers"`
+	Kind                     string     `json:"kind"`
+	RunID                    *string    `json:"run_id,omitempty"`
+	Phase                    string     `json:"phase"`
+	FilesCompleted           int64      `json:"files_completed"`
+	FilesTotal               int64      `json:"files_total"`
+	BytesCompleted           int64      `json:"bytes_completed"`
+	BytesTotal               int64      `json:"bytes_total"`
+	ChecksCompleted          int64      `json:"checks_completed"`
+	ChecksTotal              int64      `json:"checks_total"`
+	ItemsListed              int64      `json:"items_listed"`
+	ErrorsCount              int64      `json:"errors_count"`
+	CurrentItem              string     `json:"current_item,omitempty"`
+	CurrentItemBytes         int64      `json:"current_item_bytes"`
+	CurrentItemSize          int64      `json:"current_item_size"`
+	SpeedKnown               bool       `json:"speed_known"`
+	SpeedBytesPerSecond      float64    `json:"speed_bytes_per_second"`
+	FilesPerMinuteKnown      bool       `json:"files_per_minute_known"`
+	FilesPerMinute           float64    `json:"files_per_minute"`
+	UploadStartedAt          *time.Time `json:"upload_started_at,omitempty"`
+	LastMeasurableProgressAt time.Time  `json:"last_measurable_progress_at,omitempty"`
+	PossibleStall            bool       `json:"possible_stall"`
+	ActiveTransfers          int64      `json:"active_transfers"`
 }
 
 // VersionedSnapshot returns the snapshot with protocol fields set, ready for

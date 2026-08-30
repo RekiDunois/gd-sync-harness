@@ -106,6 +106,73 @@ func TestObserverStatusFallsBackToDBWithoutSpeed(t *testing.T) {
 	}
 }
 
+// TestObserverLiveRendersFilesPerMin verifies the live socket-first status
+// renderer shows Files/min from the two-sample file-rate estimator (§0.1, §8).
+func TestObserverLiveRendersFilesPerMin(t *testing.T) {
+	phase := state.PhaseUploading
+	runID := "run-fpm"
+	snap := &live.StatusSnapshot{
+		ProfileID: "obsidian-main",
+		Profile:   live.ProfileS{Enabled: true},
+		Sync:      live.SyncS{State: state.StateSyncing, Phase: &phase},
+		Activity: &live.ActivityS{
+			Kind:                live.ActivityFullReconcile,
+			RunID:               &runID,
+			Phase:               phase,
+			FilesCompleted:      120,
+			BytesCompleted:      1024,
+			BytesTotal:          8192,
+			ActiveTransfers:     12,
+			FilesPerMinuteKnown: true,
+			FilesPerMinute:      30.0,
+		},
+	}
+	var buf bytes.Buffer
+	old := outputWriter
+	outputWriter = &buf
+	defer func() { outputWriter = old }()
+	if err := renderStatusSnapshot(snap); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Files/min:") {
+		t.Fatalf("live status must render Files/min: %q", out)
+	}
+	if !strings.Contains(out, "Files/min:          30.0") {
+		t.Fatalf("Files/min value wrong: %q", out)
+	}
+}
+
+// TestObserverLiveHidesFilesPerMinOutsideTransfer verifies Files/min is not
+// rendered when the activity left the transfer phase.
+func TestObserverLiveHidesFilesPerMinOutsideTransfer(t *testing.T) {
+	phase := state.PhaseFinalizing
+	runID := "run-fpm2"
+	snap := &live.StatusSnapshot{
+		ProfileID: "obsidian-main",
+		Profile:   live.ProfileS{Enabled: true},
+		Sync:      live.SyncS{State: state.StateSyncing, Phase: &phase},
+		Activity: &live.ActivityS{
+			Kind:                live.ActivityFullReconcile,
+			RunID:               &runID,
+			Phase:               phase,
+			FilesCompleted:      120,
+			FilesPerMinuteKnown: true,
+			FilesPerMinute:      30.0,
+		},
+	}
+	var buf bytes.Buffer
+	old := outputWriter
+	outputWriter = &buf
+	defer func() { outputWriter = old }()
+	if err := renderStatusSnapshot(snap); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "Files/min:") {
+		t.Fatalf("Files/min must not render outside transfer phase: %q", buf.String())
+	}
+}
+
 // TestObserverWatchSwitchSocketToDBAcrossRestart verifies watch mode falls back
 // to DB when the socket disappears and reconnects when it returns (§18.5).
 func TestObserverWatchSwitchSocketToDBAcrossRestart(t *testing.T) {

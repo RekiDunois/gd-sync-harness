@@ -32,6 +32,7 @@ type liveActivity struct {
 	runID     *string
 	phase     string
 	estimator live.ThroughputEstimator
+	fileRate  live.FileRateEstimator
 
 	filesCompleted, bytesCompleted, bytesTotal int64
 	checksCompleted, checksTotal               int64
@@ -41,6 +42,9 @@ type liveActivity struct {
 
 	speedKnown        bool
 	speedBytesPerSec  float64
+	filesPerMinKnown  bool
+	filesPerMinute    float64
+	uploadStartedAt   *time.Time
 	lastProgress      time.Time
 	lastProgressValid bool
 }
@@ -52,6 +56,7 @@ func (t *activityTracker) start(profileID, kind string, runID *string) {
 	defer t.mu.Unlock()
 	a := &liveActivity{profileID: profileID, kind: kind, runID: runID}
 	a.estimator.Reset()
+	a.fileRate.Reset()
 	t.live[profileID] = a
 }
 
@@ -68,6 +73,24 @@ func (t *activityTracker) setPhase(profileID, phase string) {
 	if !transferPhase(phase) {
 		a.speedKnown = false
 		a.speedBytesPerSec = 0
+		a.filesPerMinKnown = false
+		a.filesPerMinute = 0
+		return
+	}
+	// Record the upload-start timestamp once when the transfer phase begins,
+	// mirroring the durable upload_started_at semantics (§9.3).
+	if phase == state.PhaseUploading {
+		a.recordUploadStart(t.now())
+	}
+}
+
+// recordUploadStart stamps the activity's upload start time once. Repeated
+// uploading phase transitions and out-of-band observe() initialization never
+// reset the baseline (§3.2).
+func (a *liveActivity) recordUploadStart(now time.Time) {
+	if a.uploadStartedAt == nil {
+		t0 := now
+		a.uploadStartedAt = &t0
 	}
 }
 
@@ -95,11 +118,16 @@ func (t *activityTracker) observe(profileID string, s state.ProgressSnapshot, me
 	a.currentItemSize = s.CurrentItemSize
 	if a.phase == "" {
 		a.phase = state.PhaseUploading
+		a.recordUploadStart(t.now())
 	}
 	if transferPhase(a.phase) {
 		rate := a.estimator.Observe(s.BytesCompleted, now)
 		a.speedKnown = rate.Known
 		a.speedBytesPerSec = rate.BytesPerSecond
+
+		fr := a.fileRate.Observe(s.FilesCompleted, now)
+		a.filesPerMinKnown = fr.Known
+		a.filesPerMinute = fr.FilesPerSec * 60
 	}
 	if measurable {
 		a.lastProgress = now
@@ -131,7 +159,13 @@ func (t *activityTracker) snapshot(profileID string) *live.ActivityS {
 		CurrentItemSize:     a.currentItemSize,
 		SpeedKnown:          a.speedKnown,
 		SpeedBytesPerSecond: a.speedBytesPerSec,
+		FilesPerMinuteKnown: a.filesPerMinKnown,
+		FilesPerMinute:      a.filesPerMinute,
 		ActiveTransfers:     a.activeTransfers,
+	}
+	if a.uploadStartedAt != nil {
+		t0 := *a.uploadStartedAt
+		out.UploadStartedAt = &t0
 	}
 	if a.runID != nil {
 		rid := *a.runID

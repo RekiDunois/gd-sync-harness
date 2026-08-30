@@ -131,6 +131,9 @@ func renderStatusSnapshot(s *live.StatusSnapshot) error {
 		if act.ActiveTransfers > 0 {
 			fmt.Fprintf(out(), "Active transfers:   %d\n", act.ActiveTransfers)
 		}
+		if act.FilesPerMinuteKnown && transferPhase(act.Phase) {
+			fmt.Fprintf(out(), "Files/min:          %.1f\n", act.FilesPerMinute)
+		}
 		fmt.Fprintf(out(), "Listed: %d\n", act.ItemsListed)
 		fmt.Fprintf(out(), "Checked: %d", act.ChecksCompleted)
 		if act.ChecksTotal > 0 {

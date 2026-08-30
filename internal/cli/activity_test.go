@@ -112,3 +112,74 @@ func TestActivityTrackerFinishesClearsState(t *testing.T) {
 		t.Fatal("activity must be cleared after finish")
 	}
 }
+
+// TestActivityTrackerFilesPerMinute verifies the live Files/min is a two-sample
+// instantaneous rate over the file counter, mirroring Speed semantics (§0.1).
+func TestActivityTrackerFilesPerMinute(t *testing.T) {
+	base := time.Unix(3000, 0)
+	now := base
+	tr := &activityTracker{live: map[string]*liveActivity{}, now: func() time.Time { return now }}
+	p := "upload-profile"
+	r := "run-upload"
+	tr.start(p, live.ActivityFullReconcile, &r)
+
+	// Not known until a second sample establishes the delta.
+	tr.setPhase(p, state.PhaseUploading)
+	tr.observe(p, state.ProgressSnapshot{FilesCompleted: 0}, false, base)
+	if snap := tr.snapshot(p); snap.FilesPerMinuteKnown {
+		t.Fatal("files/min must be unknown after a single sample")
+	}
+
+	// Second sample: 10 files over 10 seconds => 1 file/s => 60 files/min.
+	tr.observe(p, state.ProgressSnapshot{FilesCompleted: 10}, true, base.Add(10*time.Second))
+	snap := tr.snapshot(p)
+	if !snap.FilesPerMinuteKnown {
+		t.Fatal("files/min must be known after two samples")
+	}
+	if snap.FilesPerMinute != 60.0 {
+		t.Fatalf("files/min = %v, want 60.0 (10 files / 10s * 60)", snap.FilesPerMinute)
+	}
+
+	// Zero-delta over positive time is a known zero.
+	tr.observe(p, state.ProgressSnapshot{FilesCompleted: 10}, false, base.Add(15*time.Second))
+	snap = tr.snapshot(p)
+	if !snap.FilesPerMinuteKnown || snap.FilesPerMinute != 0 {
+		t.Fatalf("zero-delta files/min = known=%v rate=%v", snap.FilesPerMinuteKnown, snap.FilesPerMinute)
+	}
+
+	// Leaving the transfer phase clears files/min.
+	tr.setPhase(p, state.PhaseFinalizing)
+	snap = tr.snapshot(p)
+	if snap.FilesPerMinuteKnown || snap.FilesPerMinute != 0 {
+		t.Fatal("files/min must disappear outside a transfer phase")
+	}
+}
+
+// TestActivityTrackerFilesPerMinuteObserveInitializes verifies that when the
+// first progress frame arrives before any phase callback (empty phase), the
+// observe() path treats it as a transfer phase and feeds the file estimator.
+func TestActivityTrackerFilesPerMinuteObserveInitializes(t *testing.T) {
+	base := time.Unix(4000, 0)
+	now := base
+	tr := &activityTracker{live: map[string]*liveActivity{}, now: func() time.Time { return now }}
+	p := "upload-observe"
+	r := "run-obs"
+	tr.start(p, live.ActivityFullReconcile, &r)
+
+	// First frame with empty phase initializes to uploading.
+	tr.observe(p, state.ProgressSnapshot{FilesCompleted: 5, BytesCompleted: 1}, true, base)
+	snap := tr.snapshot(p)
+	if snap.Phase != state.PhaseUploading {
+		t.Fatalf("phase = %s, want uploading", snap.Phase)
+	}
+	if snap.FilesPerMinuteKnown {
+		t.Fatal("files/min must be unknown after the first sample")
+	}
+
+	// Later frame with a delta yields a rate.
+	tr.observe(p, state.ProgressSnapshot{FilesCompleted: 65, BytesCompleted: 2}, true, base.Add(time.Minute))
+	snap = tr.snapshot(p)
+	if !snap.FilesPerMinuteKnown || snap.FilesPerMinute != 60.0 {
+		t.Fatalf("files/min = known=%v rate=%v, want 60.0 (60 files / 60s)", snap.FilesPerMinuteKnown, snap.FilesPerMinute)
+	}
+}
