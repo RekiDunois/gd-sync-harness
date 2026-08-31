@@ -7,8 +7,8 @@ import (
 
 const (
 	Name    = "knowledge-sync"
-	Version = "0.3.0"
-	Build   = "async-reconcile"
+	Version = "0.4.0"
+	Build   = "prune-orphans"
 )
 
 // String identifies the source revision and whether the binary was built from
