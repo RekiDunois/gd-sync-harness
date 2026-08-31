@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -66,13 +67,14 @@ func runAuthorizedPrune(ctx context.Context, app *App, p *state.Profile, snap *p
 	if err != nil {
 		return err
 	}
+	cleanupDirs, err := pruneTargetAncestorDirs(targets)
+	if err != nil {
+		return fmt.Errorf("prune %s invalid frozen target: %w", req.RequestID, err)
+	}
 	pending := make([]string, 0, len(targets))
 	for _, t := range targets {
 		if t.State == state.PruneTargetDeleted || t.State == state.PruneTargetMissing {
 			continue
-		}
-		if err := validatePruneTargetPath(t.RelPath); err != nil {
-			return fmt.Errorf("prune %s invalid frozen target: %w", req.RequestID, err)
 		}
 		pending = append(pending, t.RelPath)
 	}
@@ -117,7 +119,21 @@ func runAuthorizedPrune(ctx context.Context, app *App, p *state.Profile, snap *p
 		publishPrune()
 	}
 
-	// All targets confirmed absent; compact and complete (§14.7).
+	// Remove only empty ancestor directories that belonged to the immutable
+	// target paths. Exact rmdir attempts are ordered deepest-first so a parent is
+	// removed only after target-created empty children are gone. Non-empty paths
+	// are preserved, and the profile root is never a candidate.
+	removedDirs, err := cleanupPruneEmptyDirs(ctx, app, p, cleanupDirs)
+	if err != nil {
+		_ = app.DB.SetPruneRetrying(req.RequestID, err.Error())
+		return err
+	}
+	if removedDirs > 0 {
+		lg.Printf("prune #%s removed %d empty target ancestor directories", req.RequestID, removedDirs)
+	}
+
+	// All targets confirmed absent and scoped empty-directory cleanup finished;
+	// compact and complete (§14.7).
 	if err := app.DB.CommitPruneComplete(req.RequestID); err != nil {
 		return err
 	}
@@ -197,6 +213,64 @@ func deletePruneBatch(ctx context.Context, app *App, p *state.Profile, relPaths 
 		return fmt.Errorf("delete prune batch (%d targets): %w: %s", len(relPaths), res.Err, res.StderrTrimmed())
 	}
 	return nil
+}
+
+func pruneTargetAncestorDirs(targets []state.PruneTarget) ([]string, error) {
+	seen := make(map[string]struct{})
+	for _, t := range targets {
+		if err := validatePruneTargetPath(t.RelPath); err != nil {
+			return nil, err
+		}
+		for dir := path.Dir(t.RelPath); dir != "."; dir = path.Dir(dir) {
+			if err := validatePruneTargetPath(dir); err != nil {
+				return nil, err
+			}
+			seen[dir] = struct{}{}
+		}
+	}
+
+	dirs := make([]string, 0, len(seen))
+	for dir := range seen {
+		dirs = append(dirs, dir)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		depthI := strings.Count(dirs[i], "/")
+		depthJ := strings.Count(dirs[j], "/")
+		if depthI != depthJ {
+			return depthI > depthJ
+		}
+		return dirs[i] < dirs[j]
+	})
+	return dirs, nil
+}
+
+func cleanupPruneEmptyDirs(ctx context.Context, app *App, p *state.Profile, dirs []string) (int, error) {
+	removed := 0
+	for _, dir := range dirs {
+		args := []string{"rmdir"}
+		args = append(args, app.Config.Rclone.GlobalArgs...)
+		args = append(args, p.RemoteName+":"+p.RemoteDisplayPath+"/"+dir)
+		res := app.Rclone.Run(ctx, args...)
+		if res.Err == nil {
+			removed++
+			continue
+		}
+		if pruneRmdirBenign(res.StderrTrimmed()) {
+			continue
+		}
+		return removed, fmt.Errorf("remove empty prune directory %s: %w: %s", dir, res.Err, res.StderrTrimmed())
+	}
+	return removed, nil
+}
+
+func pruneRmdirBenign(stderr string) bool {
+	msg := strings.ToLower(stderr)
+	return strings.Contains(msg, "directory not empty") ||
+		strings.Contains(msg, "is not empty") ||
+		strings.Contains(msg, "directory not found") ||
+		strings.Contains(msg, "doesn't exist") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "not exist")
 }
 
 func writePrunePathList(relPaths []string) (string, error) {
