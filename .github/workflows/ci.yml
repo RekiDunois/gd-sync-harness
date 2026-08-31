@@ -6,13 +6,18 @@ on:
     branches:
       - master
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: test (${{ matrix.os }})
+  verify:
+    name: verify (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -51,5 +56,31 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test ./...
+      - name: Build CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLI_BIN="$RUNNER_TEMP/knowledge-sync"
+          go build -trimpath -o "$CLI_BIN" ./cmd/knowledge-sync
+          test -x "$CLI_BIN"
+          go version -m "$CLI_BIN"
+          echo "CLI_BIN=$CLI_BIN" >> "$GITHUB_ENV"
+
+      - name: Smoke-test built CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CLI_BIN" --version
+          "$CLI_BIN" --help >/dev/null
+          "$CLI_BIN" profile --help >/dev/null
+          "$CLI_BIN" profile prune --help >/dev/null
+
+      - name: Test full suite
+        run: go test -count=1 ./...
+
+      - name: Verify tests leave checkout clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"

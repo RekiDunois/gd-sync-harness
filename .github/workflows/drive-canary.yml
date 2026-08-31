@@ -1,0 +1,326 @@
+name: Drive Canary
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+# The canary uses a shared dedicated Drive root. Serialize all canary runs so
+# stale cleanup from one run can never delete another active run's objects.
+concurrency:
+  group: drive-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: real-drive-cli-canary
+    # Repository secrets are available to same-repository pull requests. Fork
+    # pull requests are intentionally skipped so untrusted fork code never gets
+    # the real Drive credential. Do not replace this with pull_request_target.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CI_RCLONE_CONFIG_B64: ${{ secrets.CI_RCLONE_CONFIG_B64 }}
+      PROFILE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      REMOTE_PATH: knowledge-sync-ci/run-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install rclone
+        run: brew install rclone
+
+      - name: Require Drive canary secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CI_RCLONE_CONFIG_B64}" ]]; then
+            echo "::error::Missing repository secret CI_RCLONE_CONFIG_B64. It must contain a base64-encoded rclone config with exactly one dedicated Google Drive remote."
+            exit 1
+          fi
+
+      - name: Build release CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go build -trimpath -o dist/knowledge-sync ./cmd/knowledge-sync
+          ./dist/knowledge-sync --version
+          ./dist/knowledge-sync --help >/dev/null
+
+      - name: Configure isolated rclone and app home
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_HOME="$RUNNER_TEMP/knowledge-sync-home"
+          RCLONE_CFG="$TEST_HOME/.config/rclone/rclone.conf"
+          mkdir -p "$(dirname "$RCLONE_CFG")"
+          printf '%s' "$CI_RCLONE_CONFIG_B64" | base64 -D > "$RCLONE_CFG"
+          chmod 600 "$RCLONE_CFG"
+
+          REMOTES="$(rclone listremotes --config "$RCLONE_CFG")"
+          REMOTE_COUNT="$(printf '%s\n' "$REMOTES" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+          if [[ "$REMOTE_COUNT" != "1" ]]; then
+            echo "::error::CI rclone config must contain exactly one remote; found $REMOTE_COUNT."
+            exit 1
+          fi
+          REMOTE_NAME="$(printf '%s\n' "$REMOTES" | sed -n '1s/:$//p')"
+          test -n "$REMOTE_NAME"
+
+          echo "HOME=$TEST_HOME" >> "$GITHUB_ENV"
+          echo "RCLONE_CONFIG=$RCLONE_CFG" >> "$GITHUB_ENV"
+          echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
+
+          # This verifies the secret, credentials and configured root_folder_id
+          # before the canary creates any objects.
+          rclone about --config "$RCLONE_CFG" "$REMOTE_NAME:" >/dev/null
+
+      - name: Remove stale CI-owned Drive data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The configured remote is rooted at the dedicated
+          # knowledge-sync-ci-root folder, so this cannot escape the CI area.
+          rclone purge "$REMOTE_NAME:knowledge-sync-ci" >/dev/null 2>&1 || true
+
+          # A cancelled run can also leave a profile sidecar. Remove only
+          # sidecars whose profile_id belongs to the canary namespace.
+          while IFS= read -r name; do
+            [[ "$name" == *.json ]] || continue
+            payload="$(rclone cat "$REMOTE_NAME:.knowledge-sync/profiles/$name" 2>/dev/null)" || continue
+            owner="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("profile_id", ""))' 2>/dev/null)" || continue
+            if [[ "$owner" == ci-* ]]; then
+              rclone deletefile "$REMOTE_NAME:.knowledge-sync/profiles/$name" >/dev/null
+            fi
+          done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)
+
+      - name: Start CLI worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKER_LOG="$RUNNER_TEMP/knowledge-sync-worker.log"
+          ./dist/knowledge-sync worker >"$WORKER_LOG" 2>&1 &
+          WORKER_PID=$!
+          echo "WORKER_PID=$WORKER_PID" >> "$GITHUB_ENV"
+          echo "WORKER_LOG=$WORKER_LOG" >> "$GITHUB_ENV"
+          sleep 1
+          if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+            echo "::error::CLI worker exited during startup"
+            cat "$WORKER_LOG" || true
+            exit 1
+          fi
+
+      - name: Create test source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$RUNNER_TEMP/knowledge-sync-source"
+          mkdir -p "$SOURCE_DIR/sub"
+          printf 'alpha\n' > "$SOURCE_DIR/a.md"
+          printf 'beta\n' > "$SOURCE_DIR/sub/b.md"
+          printf 'ignored\n' > "$SOURCE_DIR/ignored.tmp"
+          printf '*.tmp\n' > "$SOURCE_DIR/.gitignore"
+          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
+
+      - name: Create profile and complete initial sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./dist/knowledge-sync profile add "$PROFILE_ID" "$SOURCE_DIR" "$REMOTE_NAME" "$REMOTE_PATH" --wait
+          ./dist/knowledge-sync profile status "$PROFILE_ID"
+          PROFILE_UUID="$(./dist/knowledge-sync profile show "$PROFILE_ID" | awk '/^uuid:/ {print $2; exit}')"
+          test -n "$PROFILE_UUID"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+
+      - name: Verify initial upload and ignore policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/a.md")" = "alpha"
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/sub/b.md")" = "beta"
+          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'ignored.tmp'; then
+            echo "ignored.tmp was uploaded unexpectedly"
+            exit 1
+          fi
+          rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only | grep -Fxq "${PROFILE_UUID}.json"
+
+      - name: Verify update reconciliation
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'alpha-v2\n' > "$SOURCE_DIR/a.md"
+          printf 'gamma\n' > "$SOURCE_DIR/c.md"
+          ./dist/knowledge-sync sync "$PROFILE_ID"
+          ./dist/knowledge-sync profile wait "$PROFILE_ID"
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/a.md")" = "alpha-v2"
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/c.md")" = "gamma"
+
+      - name: Verify normal remote deletion
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm "$SOURCE_DIR/c.md"
+          ./dist/knowledge-sync sync "$PROFILE_ID"
+          ./dist/knowledge-sync profile wait "$PROFILE_ID"
+          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'c.md'; then
+            echo "c.md still exists remotely after local deletion and reconciliation"
+            exit 1
+          fi
+
+      - name: Verify ignore refresh and explicit prune
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '*.tmp\nsub/\n' > "$SOURCE_DIR/.gitignore"
+          ./dist/knowledge-sync profile ignore update "$PROFILE_ID"
+
+          REFRESH=""
+          IGNORE_STATUS=""
+          for _ in $(seq 1 60); do
+            IGNORE_STATUS="$(./dist/knowledge-sync profile ignore status "$PROFILE_ID")"
+            REFRESH="$(printf '%s\n' "$IGNORE_STATUS" | awk -F: '/^refresh state:/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')"
+            if [[ "$REFRESH" == "ready" ]]; then
+              break
+            fi
+            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+              echo "::error::CLI worker exited while applying ignore policy"
+              cat "$WORKER_LOG" || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [[ "$REFRESH" != "ready" ]]; then
+            echo "::error::Ignore policy refresh did not reach ready"
+            printf '%s\n' "$IGNORE_STATUS"
+            ./dist/knowledge-sync profile status "$PROFILE_ID" || true
+            cat "$WORKER_LOG" || true
+            exit 1
+          fi
+
+          # Ignore refresh suppresses the previously managed object but does not
+          # silently authorize deletion. Prune is the explicit destructive edge.
+          if ! rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'sub/b.md'; then
+            echo "sub/b.md disappeared before prune authorization"
+            exit 1
+          fi
+
+          PREVIEW="$(./dist/knowledge-sync profile prune preview "$PROFILE_ID")"
+          printf '%s\n' "$PREVIEW"
+          REQUEST_ID="$(printf '%s\n' "$PREVIEW" | sed -n 's/^prune preview #//p' | head -n1)"
+          CANDIDATES="$(printf '%s\n' "$PREVIEW" | sed -n 's/^candidate set: \([0-9][0-9]*\) suppressed object(s)$/\1/p' | head -n1)"
+          test -n "$REQUEST_ID"
+          test -n "$CANDIDATES"
+          test "$CANDIDATES" -ge 1
+
+          ./dist/knowledge-sync profile prune execute "$REQUEST_ID" --allow-deletes 10
+
+          STATE=""
+          STATUS=""
+          for _ in $(seq 1 60); do
+            STATUS="$(./dist/knowledge-sync profile prune status "$REQUEST_ID")"
+            STATE="$(printf '%s\n' "$STATUS" | awk '/^state:/ {print $2; exit}')"
+            if [[ "$STATE" == "completed" ]]; then
+              break
+            fi
+            if [[ "$STATE" == "failed" || "$STATE" == "aborted" ]]; then
+              printf '%s\n' "$STATUS"
+              exit 1
+            fi
+            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+              echo "::error::CLI worker exited while executing prune"
+              cat "$WORKER_LOG" || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [[ "$STATE" != "completed" ]]; then
+            echo "::error::Prune did not complete"
+            printf '%s\n' "$STATUS"
+            ./dist/knowledge-sync profile status "$PROFILE_ID" || true
+            cat "$WORKER_LOG" || true
+            exit 1
+          fi
+
+          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'sub/b.md'; then
+            echo "suppressed file sub/b.md still exists after prune"
+            exit 1
+          fi
+
+      - name: Show diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          echo "--- profile status ---"
+          ./dist/knowledge-sync profile status "$PROFILE_ID"
+          echo "--- ignore status ---"
+          ./dist/knowledge-sync profile ignore status "$PROFILE_ID"
+          echo "--- worker log ---"
+          cat "${WORKER_LOG:-/dev/null}"
+
+      - name: Cleanup profile and remote test data
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          cleanup_failed=0
+
+          if [[ -n "${WORKER_PID:-}" ]]; then
+            kill "$WORKER_PID" >/dev/null 2>&1 || true
+            wait "$WORKER_PID" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -x ./dist/knowledge-sync ]]; then
+            ./dist/knowledge-sync profile disable "$PROFILE_ID" >/dev/null 2>&1 || true
+          fi
+
+          if [[ -n "${REMOTE_NAME:-}" ]]; then
+            rclone purge "$REMOTE_NAME:$REMOTE_PATH" >/dev/null 2>&1 || true
+
+            if [[ -n "${PROFILE_UUID:-}" ]]; then
+              rclone deletefile "$REMOTE_NAME:.knowledge-sync/profiles/${PROFILE_UUID}.json" >/dev/null 2>&1 || true
+            else
+              while IFS= read -r name; do
+                [[ "$name" == *.json ]] || continue
+                payload="$(rclone cat "$REMOTE_NAME:.knowledge-sync/profiles/$name" 2>/dev/null)" || continue
+                owner="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("profile_id", ""))' 2>/dev/null)" || continue
+                if [[ "$owner" == "$PROFILE_ID" ]]; then
+                  rclone deletefile "$REMOTE_NAME:.knowledge-sync/profiles/$name" >/dev/null 2>&1 || true
+                fi
+              done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)
+            fi
+
+            if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only >/tmp/ks-ci-leftovers 2>/dev/null; then
+              if [[ -s /tmp/ks-ci-leftovers ]]; then
+                echo "::error::Remote canary data remains after cleanup:"
+                cat /tmp/ks-ci-leftovers
+                cleanup_failed=1
+              fi
+            fi
+
+            while IFS= read -r name; do
+              [[ "$name" == *.json ]] || continue
+              payload="$(rclone cat "$REMOTE_NAME:.knowledge-sync/profiles/$name" 2>/dev/null)" || continue
+              owner="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("profile_id", ""))' 2>/dev/null)" || continue
+              if [[ "$owner" == "$PROFILE_ID" ]]; then
+                echo "::error::Sidecar $name remains after cleanup"
+                cleanup_failed=1
+              fi
+            done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)
+          fi
+
+          exit "$cleanup_failed"
