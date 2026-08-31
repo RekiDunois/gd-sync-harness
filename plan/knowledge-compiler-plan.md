@@ -59,7 +59,7 @@ local compiler immutable generation
 6. DerivedSync 与普通 sync 共享 rclone execution、worker、profile lock / remote lease、progress / error / attempt 框架，但不共享 correctness algorithm；
 7. 远端只暴露平铺的 current view，不暴露 generation UUID 目录；
 8. local immutable generation + manifest-last remote commit 共同提供 crash-safe、可验证的 publication 语义；
-9. syntax facts 必须来自固定版本第三方 parser/extension 的结构化结果，compiler 不再手写第二套 Markdown lexer；
+9. syntax facts 必须来自固定版本 Goldmark parser pipeline 的结构化结果；通常使用固定版本第三方 parser/extension，若其无法满足已表征的语法契约，允许使用 narrowly scoped project-owned Goldmark extension，但不得引入 raw-text fallback scanner 或第二套 Markdown lexer；
 10. full compile 是 V1 correctness authority；自动化、增量 cache、partition、semantic layer 全部后置。
 11. `compile` / `compiler status` / local `compiler clean` 不发现、不探测、不执行 rclone；远端工作只由 worker 执行；
 12. remote publication knowledge 与 remote binding fingerprint 绑定，migration 后不能复用旧 binding 的 published 结论。
