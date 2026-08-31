@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"knowledge-sync/internal/filter"
+	"knowledge-sync/internal/namespace"
+	"knowledge-sync/internal/source"
 	"knowledge-sync/internal/state"
 )
 
@@ -161,6 +163,16 @@ func writeFilesFrom(files []string) (string, error) {
 		return "", err
 	}
 	for _, x := range files {
+		if err := source.ValidateCanonicalRelativeTarget(x); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return "", err
+		}
+		if namespace.IsDerivedPath(x) {
+			f.Close()
+			os.Remove(f.Name())
+			return "", fmt.Errorf("reserved derived path %q is not an ordinary sync target", x)
+		}
 		esc := strings.ReplaceAll(x, "\n", "\\n")
 		if _, err := fmt.Fprintln(f, esc); err != nil {
 			f.Close()

@@ -33,6 +33,13 @@ type CommittedPolicy struct {
 	MatcherWarningCount int     `json:"matcher_warning_count"`
 }
 
+// CommittedPolicyBundle is the unambiguous runtime policy input. A policy row
+// and its snapshot bytes must both exist and agree on policy_hash.
+type CommittedPolicyBundle struct {
+	Policy   *CommittedPolicy
+	Snapshot *policy.Snapshot
+}
+
 // PolicyCommitResult reports the outcome of an ignore update.
 type PolicyCommitResult struct {
 	Changed         bool   `json:"changed"`
@@ -67,6 +74,40 @@ const committedPolicyCols = `profile_id, policy_source, policy_hash, committed_g
 func (d *DB) GetCommittedPolicy(profileID string) (*CommittedPolicy, error) {
 	return scanCommittedPolicy(d.QueryRow(`SELECT `+committedPolicyCols+`
 		FROM profile_ignore_policy WHERE profile_id = ?`, profileID))
+}
+
+// GetCommittedPolicyBundle loads and validates the committed policy atomically
+// at the API boundary. Missing rows and partial/inconsistent snapshot rows are
+// hard errors; a valid empty policy is represented by a non-nil empty snapshot.
+func (d *DB) GetCommittedPolicyBundle(profileID string) (*CommittedPolicyBundle, error) {
+	committed, err := d.GetCommittedPolicy(profileID)
+	if err != nil {
+		return nil, fmt.Errorf("committed policy for %q: %w", profileID, err)
+	}
+	files, err := d.GetPolicySnapshotFiles(profileID)
+	if err != nil {
+		return nil, err
+	}
+	var stored int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM profile_ignore_snapshot_files WHERE profile_id = ?`, profileID).Scan(&stored); err != nil {
+		return nil, err
+	}
+	if stored != len(files) {
+		return nil, fmt.Errorf("committed policy for %q has inconsistent snapshot rows", profileID)
+	}
+	var foreignHashRows int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM profile_ignore_snapshot_files
+		WHERE profile_id = ? AND policy_hash <> ?`, profileID, committed.PolicyHash).Scan(&foreignHashRows); err != nil {
+		return nil, err
+	}
+	if foreignHashRows != 0 {
+		return nil, fmt.Errorf("committed policy for %q has snapshot rows for another policy hash", profileID)
+	}
+	snap := &policy.Snapshot{Files: files}
+	if committed.PolicyHash != snap.Hash() {
+		return nil, fmt.Errorf("committed policy for %q hash mismatch: row=%s snapshot=%s", profileID, committed.PolicyHash, snap.Hash())
+	}
+	return &CommittedPolicyBundle{Policy: committed, Snapshot: snap}, nil
 }
 
 // backfillPolicyRows converts pre-policy profiles to the committed-policy model
@@ -143,10 +184,11 @@ func (d *DB) backfillPolicyRows() error {
 	return nil
 }
 func (d *DB) EnsurePolicyRow(profileID string, committedGeneration int64) error {
+	emptyHash := (&policy.Snapshot{}).Hash()
 	_, err := d.Exec(`INSERT OR IGNORE INTO profile_ignore_policy
 		(profile_id, policy_source, policy_hash, committed_generation, committed_at, refresh_state)
-		VALUES (?, ?, 'empty', ?, ?, 'pending')`,
-		profileID, PolicySourceGitignore, committedGeneration, Now().Format(timeFmt))
+		VALUES (?, ?, ?, ?, ?, 'pending')`,
+		profileID, PolicySourceGitignore, emptyHash, committedGeneration, Now().Format(timeFmt))
 	return err
 }
 
@@ -170,17 +212,15 @@ func (d *DB) GetPolicySnapshotFiles(profileID string) ([]policy.File, error) {
 	return out, rows.Err()
 }
 
-// GetCommittedSnapshot assembles a policy.Snapshot from the committed rows.
-// It returns a nil snapshot when no committed policy exists.
+// GetCommittedSnapshot assembles and validates a policy.Snapshot from the
+// committed rows. A missing policy is an error; valid empty policy rows return
+// a non-nil empty snapshot.
 func (d *DB) GetCommittedSnapshot(profileID string) (*policy.Snapshot, error) {
-	files, err := d.GetPolicySnapshotFiles(profileID)
+	bundle, err := d.GetCommittedPolicyBundle(profileID)
 	if err != nil {
 		return nil, err
 	}
-	if len(files) == 0 {
-		return nil, nil
-	}
-	return &policy.Snapshot{Files: files}, nil
+	return bundle.Snapshot, nil
 }
 
 // CommitIgnoreSnapshot atomically persists a policy snapshot with a new
@@ -514,6 +554,9 @@ func (d *DB) PolicyRefreshReadyForHash(profileID, policyHash string) (bool, erro
 // already exist (CreateProfile ran) so the worker cannot run it with an
 // accidental empty policy.
 func (d *DB) CommitPolicyForNewProfile(profileID string, snap *policy.Snapshot) error {
+	if snap == nil {
+		snap = &policy.Snapshot{}
+	}
 	tx, err := d.Begin()
 	if err != nil {
 		return err
@@ -525,9 +568,27 @@ func (d *DB) CommitPolicyForNewProfile(profileID string, snap *policy.Snapshot) 
 		return err
 	}
 	hash := snap.Hash()
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM profiles WHERE id = ?`, profileID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM profile_ignore_snapshot_files WHERE profile_id = ?`, profileID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`INSERT INTO profile_ignore_policy
 		(profile_id, policy_source, policy_hash, committed_generation, committed_at, refresh_state, matcher_warning_count)
-		VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+		VALUES (?, ?, ?, ?, ?, 'pending', ?)
+		ON CONFLICT(profile_id) DO UPDATE SET
+			policy_source = excluded.policy_source,
+			policy_hash = excluded.policy_hash,
+			committed_generation = excluded.committed_generation,
+			committed_at = excluded.committed_at,
+			refresh_state = excluded.refresh_state,
+			refreshed_policy_hash = NULL,
+			matcher_warning_count = excluded.matcher_warning_count`,
 		profileID, PolicySourceGitignore, hash, gen, now, len(snap.Warnings)); err != nil {
 		return err
 	}

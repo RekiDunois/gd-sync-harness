@@ -7,7 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 	"knowledge-sync/internal/sync"
 )
@@ -19,9 +18,6 @@ func scanProfileActive(app *App, p *state.Profile) (*sync.ScanResult, error) {
 	snap, err := app.DB.GetCommittedSnapshot(p.ID)
 	if err != nil {
 		return nil, err
-	}
-	if snap == nil {
-		snap = &policy.Snapshot{}
 	}
 	active, err := sync.ScanActivePaths(p.SourcePath, p.MaxFileSize, snap)
 	if err != nil {

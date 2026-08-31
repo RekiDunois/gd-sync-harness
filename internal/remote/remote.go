@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -120,6 +121,78 @@ func (m *Manager) ResolveFolderID(ctx context.Context, remote, remotePath string
 		}
 	}
 	return "", fmt.Errorf("could not resolve folder id for %q", remotePath)
+}
+
+// ResolveFolderIDStrict resolves a display path only when every component has
+// exactly one matching directory. It is the ownership-proof resolver; callers
+// must not use the first matching folder on ambiguous remotes.
+func (m *Manager) ResolveFolderIDStrict(ctx context.Context, remote, remotePath string) (string, error) {
+	name := strings.TrimSuffix(remote, ":")
+	parts := strings.Split(strings.Trim(remotePath, "/"), "/")
+	if len(parts) == 1 && parts[0] == "" {
+		return "", fmt.Errorf("cannot resolve folder id for remote root")
+	}
+	current := ""
+	for i, part := range parts {
+		var entries []struct {
+			Name  string `json:"Name"`
+			ID    string `json:"ID"`
+			IsDir bool   `json:"IsDir"`
+		}
+		res := m.Rclone.Run(ctx, "lsjson", name+":"+current)
+		if res.Err != nil {
+			return "", fmt.Errorf("strict binding list %s: %w: %s", name+":"+current, res.Err, res.StderrTrimmed())
+		}
+		if err := json.Unmarshal(res.Stdout, &entries); err != nil {
+			return "", fmt.Errorf("strict binding parse: %w", err)
+		}
+		matches := make([]string, 0, 1)
+		for _, entry := range entries {
+			if entry.IsDir && entry.Name == part && entry.ID != "" {
+				matches = append(matches, entry.ID)
+			}
+		}
+		if len(matches) != 1 {
+			return "", fmt.Errorf("strict binding requires exactly one directory %q under %q, found %d", part, current, len(matches))
+		}
+		current = strings.TrimPrefix(current+"/"+part, "/")
+		if i == len(parts)-1 {
+			return matches[0], nil
+		}
+	}
+	return "", fmt.Errorf("could not resolve folder id for %q", remotePath)
+}
+
+// ValidateFolderBinding proves that a profile display path still points to
+// the recorded Google Drive folder ID.
+func (m *Manager) ValidateFolderBinding(ctx context.Context, p *state.Profile) error {
+	got, err := m.ResolveFolderIDStrict(ctx, p.RemoteName, p.RemoteDisplayPath)
+	if err != nil {
+		return err
+	}
+	if got != p.RemoteFolderID {
+		return fmt.Errorf("remote binding folder id changed: expected %q, got %q", p.RemoteFolderID, got)
+	}
+	return nil
+}
+
+// InspectPath reports whether a remote directory exists and whether it has
+// direct children. A missing path is represented by exists=false for rclone's
+// normal not-found exit code.
+func (m *Manager) InspectPath(ctx context.Context, remote, remotePath string) (exists, nonEmpty bool, err error) {
+	res := m.Rclone.Run(ctx, "lsjson", strings.TrimSuffix(remote, ":")+":"+remotePath)
+	if res.Err != nil {
+		var exitErr interface{ ExitCode() int }
+		if errors.As(res.Err, &exitErr) && exitErr.ExitCode() == 3 {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("inspect remote path: %w: %s", res.Err, res.StderrTrimmed())
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(res.Stdout, &entries); err != nil {
+		return false, false, fmt.Errorf("inspect remote path parse: %w", err)
+	}
+	return true, len(entries) > 0, nil
 }
 
 // consistencyRetryDelay returns the backoff delay for the given attempt index,

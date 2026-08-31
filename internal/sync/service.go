@@ -8,7 +8,9 @@ import (
 
 	"knowledge-sync/internal/config"
 	"knowledge-sync/internal/exec"
+	"knowledge-sync/internal/namespace"
 	"knowledge-sync/internal/policy"
+	"knowledge-sync/internal/source"
 	"knowledge-sync/internal/state"
 )
 
@@ -134,6 +136,12 @@ func (s *Service) FullSyncProtected(ctx context.Context, p *state.Profile, snap 
 // budget (§11.4). It never touches suppressed objects.
 func (s *Service) DeleteRemotePaths(ctx context.Context, p *state.Profile, paths []string) error {
 	for _, rel := range paths {
+		if err := source.ValidateCanonicalRelativeTarget(rel); err != nil {
+			return fmt.Errorf("refuse malformed delete target %q: %w", rel, err)
+		}
+		if namespace.IsDerivedPath(rel) {
+			return fmt.Errorf("refuse delete of reserved derived path %q", rel)
+		}
 		res := s.Rclone.Run(ctx, "deletefile", p.RemoteName+":"+p.RemoteDisplayPath+"/"+rel)
 		if res.Err != nil {
 			return fmt.Errorf("delete %s: %w: %s", rel, res.Err, res.StderrTrimmed())
@@ -256,15 +264,8 @@ func (s *Service) VerifyFull(ctx context.Context, p *state.Profile) error {
 	return nil
 }
 
-// loadCommittedSnapshot reads the committed policy snapshot for a profile,
-// treating a missing policy as a safe empty gitignore snapshot.
+// loadCommittedSnapshot reads the validated committed policy snapshot for a
+// profile. Missing policy rows fail closed at the state API boundary.
 func loadCommittedSnapshot(s *Service, p *state.Profile) (*policy.Snapshot, error) {
-	snap, err := s.DB.GetCommittedSnapshot(p.ID)
-	if err != nil {
-		return nil, err
-	}
-	if snap == nil {
-		return &policy.Snapshot{}, nil
-	}
-	return snap, nil
+	return s.DB.GetCommittedSnapshot(p.ID)
 }

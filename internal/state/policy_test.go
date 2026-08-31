@@ -101,6 +101,9 @@ func TestCommitIgnoreSnapshotLegacyDropGate(t *testing.T) {
 	db := openTestDB(t)
 	mkPolicyProfile(t, db, "pol3")
 	// Simulate a legacy-migrated policy row.
+	if _, err := db.Exec(`DELETE FROM profile_ignore_policy WHERE profile_id = 'pol3'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(`INSERT INTO profile_ignore_policy
 		(profile_id, policy_source, policy_hash, committed_generation, committed_at, refresh_state)
 		VALUES ('pol3', 'legacy_migrated', 'old-hash', 1, '2026-01-01T00:00:00.000Z', 'pending')`); err != nil {
@@ -361,6 +364,9 @@ func TestCommitPolicyForNewProfile(t *testing.T) {
 func TestBackfillPolicyRowsMigratesLegacy(t *testing.T) {
 	db := openTestDB(t)
 	mkPolicyProfile(t, db, "backfill-legacy")
+	if _, err := db.Exec(`DELETE FROM profile_ignore_policy WHERE profile_id = 'backfill-legacy'`); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.AddExclude("backfill-legacy", RuleExcludeDirName, ".git"); err != nil {
 		t.Fatal(err)
 	}
@@ -390,6 +396,38 @@ func TestBackfillPolicyRowsMigratesLegacy(t *testing.T) {
 	// Idempotent.
 	if err := db.backfillPolicyRows(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCommittedPolicyBundleDistinguishesEmptyFromMissing(t *testing.T) {
+	db := openTestDB(t)
+	mkPolicyProfile(t, db, "bundle")
+	bundle, err := db.GetCommittedPolicyBundle("bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Snapshot == nil || len(bundle.Snapshot.Files) != 0 || bundle.Policy.PolicyHash != (&policy.Snapshot{}).Hash() {
+		t.Fatalf("empty bundle policy=%+v snapshot_files=%d", *bundle.Policy, len(bundle.Snapshot.Files))
+	}
+	if _, err := db.Exec(`DELETE FROM profile_ignore_policy WHERE profile_id = 'bundle'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetCommittedPolicyBundle("bundle"); err == nil {
+		t.Fatal("missing committed policy must fail closed")
+	}
+}
+
+func TestPruneDiscoveryRejectsMalformedAndReservedCandidates(t *testing.T) {
+	db := openTestDB(t)
+	mkPolicyProfile(t, db, "prune-guard")
+	emptyHash := (&policy.Snapshot{}).Hash()
+	if err := db.MarkPolicyRefreshReady("prune-guard", emptyHash); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{"folder/../secret.md", ".knowledge-derived/MANIFEST.json"} {
+		if _, err := db.CreatePrunePreviewFromUnmanagedPaths("prune-guard", "request-"+candidate, emptyHash, []string{candidate}); err == nil {
+			t.Fatalf("candidate %q was accepted", candidate)
+		}
 	}
 }
 

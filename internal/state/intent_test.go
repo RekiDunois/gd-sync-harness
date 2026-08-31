@@ -44,11 +44,14 @@ func buildPreV8DB(t *testing.T) string {
 		}
 	}
 	for _, q := range []string{
+		`DROP TABLE IF EXISTS compiler_profile_state`,
+		`DROP TABLE IF EXISTS compiler_runs`,
+		`DROP TABLE IF EXISTS compiler_derived_runs`,
 		`DROP TABLE IF EXISTS prune_targets`,
 		`DROP TABLE IF EXISTS prune_requests`,
 		`DROP TABLE IF EXISTS profile_ignore_snapshot_files`,
 		`DROP TABLE IF EXISTS profile_ignore_policy`,
-		`DELETE FROM schema_migrations WHERE version IN (8, 9)`,
+		`DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12)`,
 	} {
 		if _, err := fresh.Exec(q); err != nil {
 			t.Fatal(err)

@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"knowledge-sync/internal/config"
+	"knowledge-sync/internal/derived"
 	rcexec "knowledge-sync/internal/exec"
 	"knowledge-sync/internal/flock"
 	"knowledge-sync/internal/live"
@@ -30,6 +31,7 @@ type App struct {
 	Remote     *remote.Manager
 	Sync       *sync.Service
 	Reconciler *sync.Reconciler
+	Derived    *derived.Publisher
 
 	// LiveReader is the durable-state cache backing the worker status socket
 	// (§6.1). It is created for every command but only the worker's server
@@ -65,18 +67,15 @@ func (a *App) Context() (context.Context, context.CancelFunc) {
 // from persisted settings first (so launchd jobs do not depend on interactive
 // PATH, §31.2), falling back to exec.LookPath, then persisted for next time.
 func NewApp() (*App, error) {
-	if err := paths.Ensure(); err != nil {
+	app, err := NewLocalApp()
+	if err != nil {
 		return nil, err
 	}
-	dbPath, _ := paths.DBPath()
-	db, err := state.Open(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
+	db := app.DB
 
 	rcloneBin, err := resolveToolFromDB(db, "rclone")
 	if err != nil {
-		db.Close()
+		app.Close()
 		return nil, fmt.Errorf("rclone not found: %w (run 'knowledge-sync doctor')", err)
 	}
 	fswatchBin, _ := resolveToolFromDB(db, "fswatch")
@@ -86,16 +85,39 @@ func NewApp() (*App, error) {
 	defer cancel()
 	configPath, err := probe.DiscoverConfigPath(ctx)
 	if err != nil {
-		db.Close()
+		app.Close()
 		return nil, fmt.Errorf("discover rclone config: %w", err)
 	}
-
-	// Persist resolved tool paths so launchd-spawned processes reuse them.
 	_ = db.SetSetting(state.SettingRcloneBin, rcloneBin)
 	if fswatchBin != "" {
 		_ = db.SetSetting(state.SettingFSWatchBin, fswatchBin)
 	}
 	_ = db.SetSetting(state.SettingRcloneCfg, configPath)
+
+	rclone := rcexec.NewRclone(rcloneBin, configPath)
+	app.Rclone = rclone
+	app.Remote = remote.New(rclone, db)
+	app.Sync = sync.New(rclone, db, app.Config.Rclone)
+	app.Reconciler = sync.NewReconciler(app.Sync)
+	app.Derived = derived.NewPublisher(rclone, db)
+	app.ConfigPath = configPath
+	app.RcloneBin = rcloneBin
+	app.FSWatchBin = fswatchBin
+	return app, nil
+}
+
+// NewLocalApp initializes state-only dependencies. It deliberately does not
+// look up rclone, discover its config, probe a remote, or require a network.
+func NewLocalApp() (*App, error) {
+	if err := paths.Ensure(); err != nil {
+		return nil, err
+	}
+	dbPath, _ := paths.DBPath()
+	db, err := state.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+
 	appConfigPath, err := paths.AppConfigPath()
 	if err != nil {
 		db.Close()
@@ -107,17 +129,12 @@ func NewApp() (*App, error) {
 		return nil, fmt.Errorf("load knowledge-sync config %s: %w", appConfigPath, err)
 	}
 
-	rclone := rcexec.NewRclone(rcloneBin, configPath)
-	rm := remote.New(rclone, db)
-	svc := sync.New(rclone, db, appConfig.Rclone)
-	rec := sync.NewReconciler(svc)
-
 	logDir, _ := paths.LogsDir()
 
 	return &App{
-		DB: db, Rclone: rclone, Remote: rm, Sync: svc, Reconciler: rec,
+		DB:         db,
 		LiveReader: newLiveDurableReader(db), Activities: newActivityTracker(),
-		ConfigPath: configPath, RcloneBin: rcloneBin, FSWatchBin: fswatchBin,
+		ConfigPath: "", RcloneBin: "", FSWatchBin: "",
 		LogDir: logDir, LockDir: filepath.Join(mustStateDir(), "locks"), Config: appConfig,
 	}, nil
 }
@@ -225,6 +242,8 @@ func NewRootCmd() *cobra.Command {
 	}
 
 	root.AddCommand(
+		newCompileCmd(),
+		newCompilerCmd(),
 		newDoctorCmd(),
 		newStatusCmd(),
 		newInstallCmd(),

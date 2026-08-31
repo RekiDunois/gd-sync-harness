@@ -9,6 +9,7 @@ import (
 const (
 	ManifestActive     = "active"
 	ManifestSuppressed = "suppressed"
+	ManifestProtected  = "protected"
 )
 
 // ManifestEntry is one row in the managed mirror ledger, keyed by profile +
@@ -19,7 +20,7 @@ type ManifestEntry struct {
 	Size      int64  `json:"size"`
 	ModTime   int64  `json:"mod_time"` // unix seconds
 	Hash      string `json:"hash"`
-	// State is the managed ledger state: active | suppressed (§10.1).
+	// State is the managed ledger state: active | suppressed | protected (§10.1).
 	State string `json:"state"`
 	// SuppressedPolicyHash is the committed policy hash that suppressed the
 	// object, when State == suppressed.
@@ -114,7 +115,7 @@ func (d *DB) ManifestDelete(profileID, relPath string) error {
 // hash and generation (§10.2).
 func (d *DB) ManifestMarkSuppressed(profileID, relPath, policyHash string, generation int64) error {
 	_, err := d.Exec(`UPDATE manifest SET state = ?, suppressed_policy_hash = ?, suppressed_generation = ?
-		WHERE profile_id = ? AND rel_path = ?`, ManifestSuppressed, policyHash, generation, profileID, relPath)
+		WHERE profile_id = ? AND rel_path = ? AND state <> ?`, ManifestSuppressed, policyHash, generation, profileID, relPath, ManifestProtected)
 	return err
 }
 
@@ -122,7 +123,7 @@ func (d *DB) ManifestMarkSuppressed(profileID, relPath, policyHash string, gener
 // suppression provenance (§10.2).
 func (d *DB) ManifestReactivate(profileID, relPath string) error {
 	_, err := d.Exec(`UPDATE manifest SET state = ?, suppressed_policy_hash = NULL, suppressed_generation = NULL
-		WHERE profile_id = ? AND rel_path = ?`, ManifestActive, profileID, relPath)
+		WHERE profile_id = ? AND rel_path = ? AND state <> ?`, ManifestActive, profileID, relPath, ManifestProtected)
 	return err
 }
 

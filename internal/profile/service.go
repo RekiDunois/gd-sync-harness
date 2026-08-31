@@ -11,9 +11,11 @@ import (
 	"strings"
 
 	"knowledge-sync/internal/exec"
+	"knowledge-sync/internal/paths"
 	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/remote"
 	"knowledge-sync/internal/sidecar"
+	"knowledge-sync/internal/source"
 	"knowledge-sync/internal/state"
 )
 
@@ -59,16 +61,13 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 		}
 	}
 
-	fi, err := os.Stat(o.SourcePath)
-	if err != nil {
-		return nil, fmt.Errorf("source: %w", err)
-	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("source %q is not a directory", o.SourcePath)
-	}
-	abs, err := filepath.Abs(o.SourcePath)
+	stateRoot, err := paths.StateDir()
 	if err != nil {
 		return nil, err
+	}
+	abs, err := source.ValidateSourceRoot(o.SourcePath, stateRoot)
+	if err != nil {
+		return nil, fmt.Errorf("source: %w", err)
 	}
 
 	typ := strings.ToLower(o.Type)
@@ -84,6 +83,13 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 
 	if err := s.validateOverlap(abs, o.RemoteName, o.RemotePath); err != nil {
 		return nil, err
+	}
+
+	// Capture policy before remote bootstrap so a failed local policy read cannot
+	// leave a newly created remote root without a valid local creation path.
+	snap, err := policy.CollectSnapshot(abs)
+	if err != nil {
+		return nil, fmt.Errorf("capture initial ignore policy: %w", err)
 	}
 
 	uuid := newUUID()
@@ -127,20 +133,7 @@ func (s *Service) Add(ctx context.Context, o AddOptions) (*state.Profile, error)
 		return nil, err
 	}
 
-	// Capture the initial .gitignore snapshot before first synchronization
-	// (§6.1). A source with no .gitignore commits a valid empty policy. If
-	// snapshot collection fails, fail profile creation rather than starting an
-	// unsafe first upload.
-	snap, err := policy.CollectSnapshot(abs)
-	if err != nil {
-		return nil, fmt.Errorf("capture initial ignore policy: %w", err)
-	}
-
-	if err := s.DB.CreateProfile(p); err != nil {
-		return nil, err
-	}
-
-	if err := s.DB.CommitPolicyForNewProfile(o.ID, snap); err != nil {
+	if err := s.DB.CreateProfileWithPolicy(p, snap); err != nil {
 		return nil, err
 	}
 
@@ -184,13 +177,16 @@ var obsidianDefaults = [][2]string{
 // validateOverlap ensures no two active profiles share nested local sources or
 // nested remote mirrors on the same storage owner (§3 invariants 7, 8).
 func (s *Service) validateOverlap(srcAbs, remoteName, remotePath string) error {
-	all, _ := s.DB.ActiveProfiles()
+	all, _ := s.DB.ListProfiles()
 	for _, p := range all {
-		pAbs, _ := filepath.Abs(p.SourcePath)
-		if hasOverlap(srcAbs, pAbs) {
-			return fmt.Errorf("local source %q overlaps active profile %q source %q", srcAbs, p.ID, pAbs)
+		pAbs, err := filepath.EvalSymlinks(p.SourcePath)
+		if err != nil {
+			return err
 		}
-		if p.RemoteName == remoteName && hasOverlap(remotePath, p.RemoteDisplayPath) {
+		if hasOverlap(srcAbs, pAbs) {
+			return fmt.Errorf("local source %q overlaps profile %q source %q", srcAbs, p.ID, pAbs)
+		}
+		if !p.Tombstoned && p.RemoteName == remoteName && hasOverlap(remotePath, p.RemoteDisplayPath) {
 			return fmt.Errorf("remote path %q overlaps profile %q path %q on remote %q", remotePath, p.ID, p.RemoteDisplayPath, remoteName)
 		}
 	}

@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"knowledge-sync/internal/policy"
 )
 
 var (
@@ -129,6 +131,15 @@ func (d *DB) ActiveProfiles() ([]*Profile, error) {
 
 // CreateProfile inserts a new profile, rejecting duplicate and tombstoned IDs.
 func (d *DB) CreateProfile(p *Profile) error {
+	return d.CreateProfileWithPolicy(p, &policy.Snapshot{})
+}
+
+// CreateProfileWithPolicy atomically inserts profile/runtime/sync state and the
+// initial committed policy bundle.
+func (d *DB) CreateProfileWithPolicy(p *Profile, snap *policy.Snapshot) error {
+	if snap == nil {
+		snap = &policy.Snapshot{}
+	}
 	tx, err := d.Begin()
 	if err != nil {
 		return err
@@ -181,6 +192,23 @@ func (d *DB) CreateProfile(p *Profile) error {
 		VALUES (?, 1, ?)`, p.ID, StateInitializing); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`INSERT INTO compiler_profile_state (profile_id) VALUES (?)`, p.ID); err != nil {
+		return err
+	}
+	hash := snap.Hash()
+	if _, err := tx.Exec(`INSERT INTO profile_ignore_policy
+		(profile_id, policy_source, policy_hash, committed_generation, committed_at, refresh_state, matcher_warning_count)
+		VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+		p.ID, PolicySourceGitignore, hash, 1, now, len(snap.Warnings)); err != nil {
+		return err
+	}
+	for i, f := range snap.Files {
+		if _, err := tx.Exec(`INSERT INTO profile_ignore_snapshot_files
+			(profile_id, policy_hash, relative_path, scope_dir, content, content_order)
+			VALUES (?, ?, ?, ?, ?, ?)`, p.ID, hash, f.RelativePath, f.ScopeDir, f.Content, i); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -200,12 +228,30 @@ func (d *DB) UpdateProfileFields(p *Profile) error {
 
 // SetProfileEnabled flips the enabled flag.
 func (d *DB) SetProfileEnabled(id string, enabled bool) error {
-	res, err := d.Exec(`UPDATE profiles SET enabled = ?, updated_at = ? WHERE id = ?`,
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE profiles SET enabled = ?, updated_at = ? WHERE id = ?`,
 		boolInt(enabled), Now().Format(timeFmt), id)
 	if err != nil {
 		return err
 	}
-	return checkRows(res)
+	if err := checkRows(res); err != nil {
+		return err
+	}
+	if enabled {
+		_, err = tx.Exec(`UPDATE compiler_profile_state SET derived_state = 'pending'
+			WHERE profile_id = ? AND derived_state = 'blocked_disabled'`, id)
+	} else {
+		_, err = tx.Exec(`UPDATE compiler_profile_state SET derived_state = 'blocked_disabled'
+			WHERE profile_id = ?`, id)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // TombstoneProfile marks a profile deleted (soft delete), clearing enabled.

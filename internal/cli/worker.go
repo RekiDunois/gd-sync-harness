@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	knowledgecompiler "knowledge-sync/internal/compiler"
 	rcexec "knowledge-sync/internal/exec"
 	"knowledge-sync/internal/flock"
 	"knowledge-sync/internal/live"
@@ -153,6 +154,9 @@ func startWorkerLiveServer(app *App, lg *log.Logger) *live.Server {
 // requests are finalized when no active run holds ownership (§17.2, §17.3).
 func workerRecover(ctx context.Context, app *App, onlyProfile string, lg *log.Logger) error {
 	lg = workerLog(lg)
+	if err := app.DB.RecoverDerivedRuns(); err != nil {
+		return err
+	}
 	ps, err := activeProfilesFor(app, onlyProfile)
 	if err != nil {
 		return err
@@ -240,6 +244,9 @@ func runWorkerPass(ctx context.Context, app *App, onlyProfile string, lg *log.Lo
 				if err := runFastUpsertBatchOwned(ctx, app, ownedProfile, ownedSnapshot, lg); err != nil {
 					lg.Printf("fast upsert %s: %v", p.ID, err)
 				}
+				if err := runDerivedPass(ctx, app, ownedProfile, lg); err != nil {
+					lg.Printf("derived sync %s: %v", p.ID, err)
+				}
 				return
 			}
 			lg.Printf("claimed run %s for %s (target_generation=%d, kind=%s)", run.ID, p.ID, run.TargetGeneration, run.Kind)
@@ -252,9 +259,107 @@ func runWorkerPass(ctx context.Context, app *App, onlyProfile string, lg *log.Lo
 			} else {
 				lg.Printf("run %s (%s) succeeded", run.ID, p.ID)
 			}
+			if err := runDerivedPass(ctx, app, ownedProfile, lg); err != nil {
+				lg.Printf("derived sync %s: %v", p.ID, err)
+			}
 		}()
 	}
 	return finalizeDeletions(app)
+}
+
+// runDerivedPass converges the current level-triggered compiler desire after
+// the ordinary lane. Ordinary failures do not suppress this independent lane.
+func runDerivedPass(ctx context.Context, app *App, p *state.Profile, lg *log.Logger) error {
+	if app.Derived == nil {
+		// Test/minimal App instances from before DerivedSync was introduced do
+		// not own a remote publisher; the production App wires one in NewApp.
+		return nil
+	}
+	binding := state.DerivedBindingFingerprint(p.RemoteName, p.RemoteFolderID)
+	var run *state.DerivedRun
+	var claimed bool
+	err := app.withCompilerLock(p.ProfileUUID, func() error {
+		var err error
+		run, claimed, err = app.DB.ClaimDerivedRun(p.ID, newRunID(), binding)
+		if err == nil && claimed && run.Kind == state.DerivedRunPublish && run.TargetGenerationID != nil {
+			root, rootErr := paths.CompilerRoot(p.ProfileUUID)
+			if rootErr != nil {
+				return rootErr
+			}
+			if verifyErr := knowledgecompiler.NewStore(root).VerifyGeneration(*run.TargetGenerationID); verifyErr != nil {
+				failure := state.RunFailure{Code: "derived_generation_invalid", Classification: state.RetryTerminal, Message: verifyErr.Error()}
+				if finishErr := app.DB.FinishDerivedRunFailure(p.ID, run.ID, run.TargetKey, failure.Code, failure.Classification, failure.Message); finishErr != nil {
+					return finishErr
+				}
+				return verifyErr
+			}
+		}
+		return err
+	})
+	if err != nil || !claimed {
+		return err
+	}
+	app.activities().start(p.ID, live.ActivityDerived, &run.ID)
+	defer app.activities().finish(p.ID)
+	setPhase := func(phase string) {
+		_ = app.DB.UpdateDerivedRunPhase(p.ID, run.ID, phase)
+		app.activities().setPhase(p.ID, phase)
+		if app.LiveServer != nil {
+			app.LiveServer.PublishActivity(p.ID, app.activities().snapshot(p.ID))
+		}
+	}
+	var opErr error
+	if run.Kind == state.DerivedRunPurge {
+		opErr = app.Derived.Purge(ctx, p, setPhase)
+	} else if run.TargetGenerationID == nil {
+		opErr = fmt.Errorf("derived publish has no target generation")
+	} else {
+		opErr = app.Derived.Publish(ctx, p, *run.TargetGenerationID, func(s rcexec.ProgressStats) {
+			app.activities().observe(p.ID, progressSnapshot(s), s.MeasurableProgress(nil), state.Now())
+			if app.LiveServer != nil {
+				app.LiveServer.PublishActivity(p.ID, app.activities().snapshot(p.ID))
+			}
+		}, setPhase)
+	}
+	if opErr != nil {
+		failure := classifyError(opErr, "derived_publish")
+		err := app.DB.FinishDerivedRunFailure(p.ID, run.ID, run.TargetKey, failure.Code, failure.Classification, failure.Message)
+		if cleanupErr := finalizePendingCompilerClean(app, p); err == nil {
+			err = cleanupErr
+		}
+		return err
+	}
+	if err := app.DB.FinishDerivedRunSuccess(p.ID, run.ID, binding, run.TargetGenerationID, run.Kind); err != nil {
+		return err
+	}
+	return finalizePendingCompilerClean(app, p)
+}
+
+func finalizePendingCompilerClean(app *App, p *state.Profile) error {
+	current, err := app.DB.GetCompilerState(p.ID)
+	if err != nil || current.LocalCleanState != "committing" || current.ActivePublishGenerationID != nil {
+		return err
+	}
+	return app.withCompilerLock(p.ProfileUUID, func() error {
+		current, err := app.DB.GetCompilerState(p.ID)
+		if err != nil || current.LocalCleanState != "committing" || current.ActivePublishGenerationID != nil {
+			return err
+		}
+		root, err := paths.CompilerRoot(p.ProfileUUID)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(root, "MANIFEST.json")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.RemoveAll(filepath.Join(root, "generations")); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(filepath.Join(root, "staging")); err != nil {
+			return err
+		}
+		return app.DB.FinishCompilerClean(p.ID)
+	})
 }
 
 // loadOwnedExecutionState reloads the durable profile and committed policy
@@ -270,10 +375,6 @@ func loadOwnedExecutionState(app *App, profileID string) (*state.Profile, *polic
 	snap, err := app.DB.GetCommittedSnapshot(profileID)
 	if err != nil {
 		return nil, nil, err
-	}
-	if snap == nil {
-		// No committed policy: treat as a safe empty gitignore policy.
-		snap = &policy.Snapshot{}
 	}
 	return p, snap, nil
 }

@@ -300,6 +300,97 @@ func migrate(db *sql.DB) error {
 		CREATE INDEX idx_prune_requests_profile ON prune_requests(profile_id, state, created_at);
 		CREATE INDEX idx_prune_targets_request ON prune_targets(request_id);
 		`,
+		// v10: reserve the derived namespace in the managed ledger. Any frozen
+		// prune request containing a reserved target is stale before it can be
+		// executed.
+		`
+		UPDATE manifest SET state = 'protected', suppressed_policy_hash = NULL,
+			suppressed_generation = NULL
+		WHERE rel_path = '.knowledge-derived' OR rel_path LIKE '.knowledge-derived/%';
+		UPDATE prune_requests SET state = 'stale', updated_at = CURRENT_TIMESTAMP
+		WHERE state NOT IN ('completed', 'stale', 'superseded')
+		AND EXISTS (
+			SELECT 1 FROM prune_targets t
+			WHERE t.request_id = prune_requests.request_id
+			AND (t.rel_path = '.knowledge-derived' OR t.rel_path LIKE '.knowledge-derived/%')
+		);
+		`,
+		// v11: local compiler operational state and derived desired-state shell.
+		`
+		CREATE TABLE compiler_runs (
+			id TEXT PRIMARY KEY,
+			profile_id TEXT NOT NULL,
+			candidate_generation_id TEXT,
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			status TEXT NOT NULL,
+			compiler_version TEXT NOT NULL,
+			schema_version INTEGER NOT NULL,
+			source_snapshot_id TEXT,
+			policy_hash TEXT,
+			eligibility_contract_hash TEXT,
+			file_count INTEGER NOT NULL DEFAULT 0,
+			warning_count INTEGER NOT NULL DEFAULT 0,
+			error TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+		);
+		CREATE INDEX idx_compiler_runs_profile ON compiler_runs(profile_id, started_at);
+		CREATE TABLE compiler_profile_state (
+			profile_id TEXT PRIMARY KEY,
+			last_success_generation_id TEXT,
+			last_success_at TEXT,
+			last_source_snapshot_id TEXT,
+			last_policy_hash TEXT,
+			last_eligibility_contract_hash TEXT,
+			local_mode TEXT NOT NULL DEFAULT 'absent',
+			local_clean_state TEXT NOT NULL DEFAULT 'none',
+			local_clean_operation_id TEXT,
+			desired_derived_mode TEXT NOT NULL DEFAULT 'absent',
+			desired_derived_generation_id TEXT,
+			desired_derived_revision INTEGER NOT NULL DEFAULT 0,
+			current_remote_binding_fingerprint TEXT,
+			remote_published_generation_id TEXT,
+			remote_published_binding_fingerprint TEXT,
+			remote_state TEXT NOT NULL DEFAULT 'unknown',
+			remote_state_binding_fingerprint TEXT,
+			derived_state TEXT NOT NULL DEFAULT 'pending',
+			active_publish_generation_id TEXT,
+			last_derived_error TEXT,
+			last_derived_success_at TEXT,
+			FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+		);
+		INSERT OR IGNORE INTO compiler_profile_state (profile_id)
+			SELECT id FROM profiles;
+		`,
+		// v12: durable DerivedSync attempt history and retry gate.
+		`
+		ALTER TABLE compiler_profile_state ADD COLUMN derived_retry_target_key TEXT;
+		ALTER TABLE compiler_profile_state ADD COLUMN derived_retry_classification TEXT;
+		ALTER TABLE compiler_profile_state ADD COLUMN derived_consecutive_failures INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE compiler_profile_state ADD COLUMN derived_limited_failures INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE compiler_profile_state ADD COLUMN derived_next_retry_at TEXT;
+		ALTER TABLE compiler_profile_state ADD COLUMN derived_terminal_error_code TEXT;
+		CREATE TABLE compiler_derived_runs (
+			id TEXT PRIMARY KEY,
+			profile_id TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			target_generation_id TEXT,
+			target_binding_fingerprint TEXT NOT NULL,
+			target_desired_revision INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			phase TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL,
+			completed_at TEXT,
+			files_completed INTEGER NOT NULL DEFAULT 0,
+			bytes_completed INTEGER NOT NULL DEFAULT 0,
+			last_progress_at TEXT,
+			error_code TEXT NOT NULL DEFAULT '',
+			error_classification TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+		);
+		CREATE INDEX idx_compiler_derived_runs_profile ON compiler_derived_runs(profile_id, started_at);
+		`,
 	}
 
 	for i, m := range migrations {

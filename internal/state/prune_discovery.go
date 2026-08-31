@@ -3,9 +3,10 @@ package state
 import (
 	"database/sql"
 	"fmt"
-	"path"
 	"sort"
-	"strings"
+
+	"knowledge-sync/internal/namespace"
+	"knowledge-sync/internal/source"
 )
 
 // CreatePrunePreviewFromUnmanagedPaths freezes an explicitly discovered set of
@@ -30,7 +31,10 @@ func (d *DB) CreatePrunePreviewFromUnmanagedPaths(profileID, requestID, expected
 		return nil, fmt.Errorf("policy changed or refresh is not ready; repeat orphan discovery")
 	}
 
-	paths := normalizePruneCandidatePaths(candidates)
+	paths, err := normalizePruneCandidatePaths(candidates)
+	if err != nil {
+		return nil, err
+	}
 	filtered := paths[:0]
 	for _, relPath := range paths {
 		var n int
@@ -84,23 +88,21 @@ func (d *DB) CreatePrunePreviewFromUnmanagedPaths(profileID, requestID, expected
 	}, nil
 }
 
-func normalizePruneCandidatePaths(candidates []string) []string {
+func normalizePruneCandidatePaths(candidates []string) ([]string, error) {
 	set := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
-		relPath := strings.TrimSpace(strings.ReplaceAll(candidate, "\\", "/"))
-		if relPath == "" || strings.HasPrefix(relPath, "/") {
-			continue
+		if err := source.ValidateCanonicalRelativeTarget(candidate); err != nil {
+			return nil, fmt.Errorf("invalid prune candidate %q: %w", candidate, err)
 		}
-		relPath = path.Clean(relPath)
-		if relPath == "." || relPath == ".." || strings.HasPrefix(relPath, "../") {
-			continue
+		if namespace.IsDerivedPath(candidate) {
+			return nil, fmt.Errorf("reserved derived path %q cannot be a prune candidate", candidate)
 		}
-		set[relPath] = struct{}{}
+		set[candidate] = struct{}{}
 	}
 	out := make([]string, 0, len(set))
 	for relPath := range set {
 		out = append(out, relPath)
 	}
 	sort.Strings(out)
-	return out
+	return out, nil
 }
