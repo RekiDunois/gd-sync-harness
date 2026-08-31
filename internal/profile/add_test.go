@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	rcexec "knowledge-sync/internal/exec"
+	"knowledge-sync/internal/paths"
 	"knowledge-sync/internal/remote"
 	"knowledge-sync/internal/state"
 )
@@ -51,6 +52,11 @@ func mockDrive(t *testing.T) (*Service, *state.DB, *rcexec.Rclone, string) {
 }
 
 func TestProfileAddWithMockRemote(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+
 	svc, db, _, _ := mockDrive(t)
 	src := t.TempDir()
 	mkdirTree(t, src, ".obsidian")
