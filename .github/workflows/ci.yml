@@ -14,9 +14,10 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: test (${{ matrix.os }})
+  verify:
+    name: verify (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -55,5 +56,30 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test ./...
+      - name: Build CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          go build -trimpath -o dist/knowledge-sync ./cmd/knowledge-sync
+          test -x dist/knowledge-sync
+          go version -m dist/knowledge-sync
+
+      - name: Smoke-test built CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./dist/knowledge-sync --version
+          ./dist/knowledge-sync --help >/dev/null
+          ./dist/knowledge-sync profile --help >/dev/null
+          ./dist/knowledge-sync profile prune --help >/dev/null
+
+      - name: Test full suite
+        run: go test -count=1 ./...
+
+      - name: Verify tests leave checkout clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
