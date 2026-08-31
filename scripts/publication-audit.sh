@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 Usage: scripts/publication-audit.sh [--current|--history|--all] [--denylist FILE]
 
 Audits tracked Git content before changing a repository from private to public.
@@ -17,7 +17,7 @@ Optional denylist:
   --denylist FILE
       FILE must live outside the repository. Each non-empty, non-comment line
       is treated as an exact private identifier to locate without printing it.
-EOF
+USAGE
 }
 
 mode="all"
@@ -54,11 +54,33 @@ fi
 
 # High-confidence credential value shapes. These deliberately avoid generic
 # words such as "password" or "token" because project documentation discusses
-# those concepts legitimately.
-secret_value_re='(AIza[0-9A-Za-z_-]{35}|gh[pousr]_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{20,}|AKIA[0-9A-Z]{16}|1//[0-9A-Za-z_-]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)'
+# those concepts legitimately. Dedicated scanners (gitleaks/trufflehog) remain
+# required by the publication task; this script is an additional repository-
+# specific guard, not a replacement for them.
+secret_value_re='(AIza[0-9A-Za-z_-]{35}|gh[pousr]_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{20,}|AKIA[0-9A-Z]{16}|GOCSPX-[0-9A-Za-z_-]{20,}|1//[0-9A-Za-z_-]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)'
 privacy_re='(/Users/[^/[:space:]]+|/home/[^/[:space:]]+|[A-Za-z0-9._%+-]+@(gmail\.com|icloud\.com|outlook\.com|hotmail\.com))'
 credential_file_re='(^|/)(rclone\.conf|credentials\.json|token\.json|client_secret_[^/]+\.json|[^/]*service-account[^/]*\.json|application_default_credentials\.json|[^/]+\.(pem|key|p12|pfx|jks|keystore))$'
 privacy_exclude_paths=(':(exclude)AGENTS.md' ':(exclude)AGENT.md' ':(exclude)scripts/publication-audit.sh')
+
+validate_detectors() {
+  printf '%s\n' 'audit-sample@gmail.com' | grep -Eq "$privacy_re" || {
+    echo "publication audit internal error: email detector self-test failed" >&2
+    exit 2
+  }
+  printf '%s\n' 'rclone.conf' | grep -Eq "$credential_file_re" || {
+    echo "publication audit internal error: credential filename detector self-test failed" >&2
+    exit 2
+  }
+  printf '%s\n' 'nested/client_secret_example.json' | grep -Eq "$credential_file_re" || {
+    echo "publication audit internal error: nested credential filename detector self-test failed" >&2
+    exit 2
+  }
+  if printf '%s\n' 'docs/example.md' | grep -Eq "$credential_file_re"; then
+    echo "publication audit internal error: credential filename detector self-test false positive" >&2
+    exit 2
+  fi
+}
+validate_detectors
 
 fail=0
 warn=0
@@ -121,6 +143,7 @@ report_current() {
 
 report_history() {
   echo "== all reachable Git history/refs =="
+  : >"$tmp/history-credential-files"
   : >"$tmp/history-secret"
   : >"$tmp/history-privacy"
   : >"$tmp/history-deny"
@@ -128,13 +151,27 @@ report_history() {
   : >"$tmp/message-privacy"
   : >"$tmp/message-deny"
 
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if printf '%s\n' "$f" | grep -Eq "$credential_file_re"; then
+      printf '%s\n' "$f" >>"$tmp/history-credential-files"
+    fi
+  done < <(git log --all --format= --name-only --diff-filter=ACMRT 2>/dev/null | sort -u)
+  if [[ -s "$tmp/history-credential-files" ]]; then
+    echo "WARN: credential-like filenames occur in reachable history; review these paths:"
+    sed 's/^/  /' "$tmp/history-credential-files"
+    warn=1
+  else
+    echo "OK: no credential-like filenames in reachable history"
+  fi
+
   while IFS= read -r rev; do
     while IFS= read -r path; do
-      [[ -n "$path" ]] && printf '%s:%s\n' "$rev" "$path" >>"$tmp/history-secret"
+      [[ -n "$path" ]] && printf '%s\n' "$path" >>"$tmp/history-secret"
     done < <(git grep -Il -E "$secret_value_re" "$rev" -- . 2>/dev/null || true)
 
     while IFS= read -r path; do
-      [[ -n "$path" ]] && printf '%s:%s\n' "$rev" "$path" >>"$tmp/history-privacy"
+      [[ -n "$path" ]] && printf '%s\n' "$path" >>"$tmp/history-privacy"
     done < <(git grep -Il -E "$privacy_re" "$rev" -- . "${privacy_exclude_paths[@]}" 2>/dev/null || true)
 
     msg="$(git show -s --format='%B' "$rev")"
@@ -150,7 +187,7 @@ report_history() {
         [[ -n "$needle" ]] || continue
         [[ "$needle" == \#* ]] && continue
         while IFS= read -r path; do
-          [[ -n "$path" ]] && printf '%s:%s\n' "$rev" "$path" >>"$tmp/history-deny"
+          [[ -n "$path" ]] && printf '%s\n' "$path" >>"$tmp/history-deny"
         done < <(git grep -Il -F -- "$needle" "$rev" -- . 2>/dev/null || true)
         if printf '%s\n' "$msg" | grep -Fq -- "$needle"; then
           printf '%s\n' "$rev" >>"$tmp/message-deny"
