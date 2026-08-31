@@ -7,7 +7,7 @@ import (
 
 const (
 	Name    = "knowledge-sync"
-	Version = "0.4.0"
+	Version = "0.4.1"
 	Build   = "prune-orphans"
 )
 
