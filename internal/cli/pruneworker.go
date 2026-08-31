@@ -62,7 +62,9 @@ func runAuthorizedPrune(ctx context.Context, app *App, p *state.Profile, snap *p
 		return err
 	}
 
-	// Delete only the immutable managed target rows for this request (§14.5).
+	// Delete only the immutable target rows for this request (§14.5). Targets
+	// can be suppressed managed objects or explicitly discovered ignored remote
+	// orphans; the request itself is the deletion authority.
 	for _, t := range targets {
 		if t.State == state.PruneTargetDeleted || t.State == state.PruneTargetMissing {
 			continue
@@ -72,6 +74,12 @@ func runAuthorizedPrune(ctx context.Context, app *App, p *state.Profile, snap *p
 			// A missing remote object converges to success (§14.5).
 			if pruneRemoteMissing(res) {
 				if err := app.DB.MarkPruneTargetResult(req.RequestID, t.RelPath, state.PruneTargetMissing, ""); err != nil {
+					return err
+				}
+				// If this target came from the suppressed managed ledger, a
+				// confirmed remote absence also closes that ownership record. For
+				// unmanaged-orphan targets this is a harmless no-op.
+				if err := app.DB.ManifestDelete(p.ID, t.RelPath); err != nil {
 					return err
 				}
 				continue
