@@ -60,19 +60,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          go build -trimpath -o dist/knowledge-sync ./cmd/knowledge-sync
-          test -x dist/knowledge-sync
-          go version -m dist/knowledge-sync
+          CLI_BIN="$RUNNER_TEMP/knowledge-sync"
+          go build -trimpath -o "$CLI_BIN" ./cmd/knowledge-sync
+          test -x "$CLI_BIN"
+          go version -m "$CLI_BIN"
+          echo "CLI_BIN=$CLI_BIN" >> "$GITHUB_ENV"
 
       - name: Smoke-test built CLI
         shell: bash
         run: |
           set -euo pipefail
-          ./dist/knowledge-sync --version
-          ./dist/knowledge-sync --help >/dev/null
-          ./dist/knowledge-sync profile --help >/dev/null
-          ./dist/knowledge-sync profile prune --help >/dev/null
+          "$CLI_BIN" --version
+          "$CLI_BIN" --help >/dev/null
+          "$CLI_BIN" profile --help >/dev/null
+          "$CLI_BIN" profile prune --help >/dev/null
 
       - name: Test full suite
         run: go test -count=1 ./...
