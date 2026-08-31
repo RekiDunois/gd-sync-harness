@@ -1,16 +1,17 @@
 name: Drive Canary
 
 on:
+  pull_request:
   push:
     branches:
       - master
   workflow_dispatch:
 
-# Every run owns a unique remote path. A newer run cancels an obsolete one and
-# starts by removing stale CI-owned data before creating anything new.
+# The canary uses a shared dedicated Drive root. Serialize all canary runs so
+# stale cleanup from one run can never delete another active run's objects.
 concurrency:
   group: drive-canary
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -18,6 +19,10 @@ permissions:
 jobs:
   canary:
     name: real-drive-cli-canary
+    # Repository secrets are available to same-repository pull requests. Fork
+    # pull requests are intentionally skipped so untrusted fork code never gets
+    # the real Drive credential. Do not replace this with pull_request_target.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: macos-latest
     timeout-minutes: 30
     env:
