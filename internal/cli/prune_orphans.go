@@ -82,7 +82,7 @@ func pruneDiscoverCmd() *cobra.Command {
 }
 
 func discoverIgnoredRemoteOrphans(ctx context.Context, app *App, p *state.Profile, snap *policy.Snapshot) ([]string, error) {
-	res := app.Rclone.Run(ctx, "lsf", p.RemoteName+":"+p.RemoteDisplayPath, "--recursive", "--files-only")
+	res := app.Rclone.Run(ctx, "lsf", "--recursive", "--files-only", p.RemoteName+":"+p.RemoteDisplayPath)
 	if res.Err != nil {
 		return nil, fmt.Errorf("list remote files for orphan discovery: %w: %s", res.Err, res.StderrTrimmed())
 	}
