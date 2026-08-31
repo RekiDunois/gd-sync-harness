@@ -1,16 +1,21 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path"
+	"strconv"
 	"strings"
 
-	rcexec "knowledge-sync/internal/exec"
 	"knowledge-sync/internal/live"
 	"knowledge-sync/internal/policy"
 	"knowledge-sync/internal/state"
 )
+
+const pruneDeleteBatchSize = 512
 
 // runAuthorizedPrune executes an authorized, policy-valid prune request under
 // the profile lock and remote lease (§14). It is a worker-owned data-plane
@@ -61,54 +66,175 @@ func runAuthorizedPrune(ctx context.Context, app *App, p *state.Profile, snap *p
 	if err != nil {
 		return err
 	}
-
-	// Delete only the immutable target rows for this request (§14.5). Targets
-	// can be suppressed managed objects or explicitly discovered ignored remote
-	// orphans; the request itself is the deletion authority.
+	pending := make([]string, 0, len(targets))
 	for _, t := range targets {
 		if t.State == state.PruneTargetDeleted || t.State == state.PruneTargetMissing {
 			continue
 		}
-		res := app.Rclone.Run(ctx, "deletefile", p.RemoteName+":"+p.RemoteDisplayPath+"/"+t.RelPath)
-		if res.Err != nil {
-			// A missing remote object converges to success (§14.5).
-			if pruneRemoteMissing(res) {
-				if err := app.DB.MarkPruneTargetResult(req.RequestID, t.RelPath, state.PruneTargetMissing, ""); err != nil {
-					return err
-				}
-				// If this target came from the suppressed managed ledger, a
-				// confirmed remote absence also closes that ownership record. For
-				// unmanaged-orphan targets this is a harmless no-op.
-				if err := app.DB.ManifestDelete(p.ID, t.RelPath); err != nil {
-					return err
-				}
-				continue
-			}
-			// Retryable provider errors move the request to retrying; durable
-			// authorization is preserved (§14.6).
-			_ = app.DB.SetPruneRetrying(req.RequestID, res.StderrTrimmed())
-			return fmt.Errorf("prune %s target %s: %w: %s", req.RequestID, t.RelPath, res.Err, res.StderrTrimmed())
+		if err := validatePruneTargetPath(t.RelPath); err != nil {
+			return fmt.Errorf("prune %s invalid frozen target: %w", req.RequestID, err)
 		}
-		if err := app.DB.MarkPruneTargetResult(req.RequestID, t.RelPath, state.PruneTargetDeleted, ""); err != nil {
+		pending = append(pending, t.RelPath)
+	}
+
+	// Resolve current existence in one filtered listing. This preserves the
+	// deleted-vs-missing summary without paying for one rclone process per
+	// target. --files-from-raw is an exact allow-list rooted at the managed
+	// profile path; missing names are not treated as an rclone error.
+	existing, missing, err := classifyPruneRemotePaths(ctx, app, p, pending)
+	if err != nil {
+		_ = app.DB.SetPruneRetrying(req.RequestID, err.Error())
+		return err
+	}
+	if len(missing) > 0 {
+		if err := app.DB.MarkPruneTargetsResultBatch(req.RequestID, missing, state.PruneTargetMissing); err != nil {
 			return err
 		}
+		app.liveReader().Refresh(p.ID)
+		publishPrune()
 	}
-	// All targets confirmed; compact and complete (§14.7).
+
+	// Delete the exact immutable target set in bounded batches. rclone's delete
+	// implementation fans deletions out through its checker pool, so each batch
+	// reuses one authenticated process while preserving durable checkpoints
+	// between batches. A failed batch is intentionally not marked successful;
+	// on retry, the existence pass above classifies any partial deletes as
+	// already missing and safely resumes the remainder.
+	for start := 0; start < len(existing); start += pruneDeleteBatchSize {
+		end := start + pruneDeleteBatchSize
+		if end > len(existing) {
+			end = len(existing)
+		}
+		batch := existing[start:end]
+		if err := deletePruneBatch(ctx, app, p, batch); err != nil {
+			_ = app.DB.SetPruneRetrying(req.RequestID, err.Error())
+			return err
+		}
+		if err := app.DB.MarkPruneTargetsResultBatch(req.RequestID, batch, state.PruneTargetDeleted); err != nil {
+			return err
+		}
+		app.liveReader().Refresh(p.ID)
+		publishPrune()
+	}
+
+	// All targets confirmed absent; compact and complete (§14.7).
 	if err := app.DB.CommitPruneComplete(req.RequestID); err != nil {
 		return err
 	}
-	lg.Printf("prune #%s completed (%d deleted, %d missing)", req.RequestID, req.DeletedCount, req.MissingCount)
+	completed, _ := app.DB.GetPruneRequest(req.RequestID)
+	if completed != nil {
+		lg.Printf("prune #%s completed (%d deleted, %d missing)", completed.RequestID, completed.DeletedCount, completed.MissingCount)
+	} else {
+		lg.Printf("prune #%s completed", req.RequestID)
+	}
 	app.liveReader().Refresh(p.ID)
 	publishPrune()
 	return nil
 }
 
-// pruneRemoteMissing classifies a deletefile error as the remote object being
-// absent. Most backends treat a missing object as success; when deletefile
-// errors, a message mentioning not-exist/missing means the object is already
-// gone and the target converges to success.
-func pruneRemoteMissing(res rcexec.Result) bool {
-	msg := strings.ToLower(res.StderrTrimmed())
-	return strings.Contains(msg, "not exist") || strings.Contains(msg, "file not found") ||
-		strings.Contains(msg, "missing") || strings.Contains(msg, "not found")
+func classifyPruneRemotePaths(ctx context.Context, app *App, p *state.Profile, relPaths []string) (existing, missing []string, err error) {
+	if len(relPaths) == 0 {
+		return nil, nil, nil
+	}
+	listPath, err := writePrunePathList(relPaths)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer os.Remove(listPath)
+
+	args := []string{"lsf", "--recursive", "--files-only", "--files-from-raw", listPath}
+	args = append(args, app.Config.Rclone.GlobalArgs...)
+	args = append(args, p.RemoteName+":"+p.RemoteDisplayPath)
+	res := app.Rclone.Run(ctx, args...)
+	if res.Err != nil {
+		return nil, nil, fmt.Errorf("list prune targets: %w: %s", res.Err, res.StderrTrimmed())
+	}
+
+	found := make(map[string]struct{}, len(relPaths))
+	scanner := bufio.NewScanner(strings.NewReader(string(res.Stdout)))
+	scanner.Buffer(make([]byte, 4096), 2<<20)
+	for scanner.Scan() {
+		rel := scanner.Text()
+		if rel != "" {
+			found[rel] = struct{}{}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("parse prune target listing: %w", err)
+	}
+
+	existing = make([]string, 0, len(relPaths))
+	missing = make([]string, 0)
+	for _, rel := range relPaths {
+		if _, ok := found[rel]; ok {
+			existing = append(existing, rel)
+		} else {
+			missing = append(missing, rel)
+		}
+	}
+	return existing, missing, nil
+}
+
+func deletePruneBatch(ctx context.Context, app *App, p *state.Profile, relPaths []string) error {
+	if len(relPaths) == 0 {
+		return nil
+	}
+	listPath, err := writePrunePathList(relPaths)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(listPath)
+
+	args := []string{
+		"delete",
+		"--files-from-raw", listPath,
+		"--max-delete", strconv.Itoa(len(relPaths)),
+	}
+	args = append(args, app.Config.Rclone.GlobalArgs...)
+	args = append(args, p.RemoteName+":"+p.RemoteDisplayPath)
+	res := app.Rclone.Run(ctx, args...)
+	if res.Err != nil {
+		return fmt.Errorf("delete prune batch (%d targets): %w: %s", len(relPaths), res.Err, res.StderrTrimmed())
+	}
+	return nil
+}
+
+func writePrunePathList(relPaths []string) (string, error) {
+	f, err := os.CreateTemp("", "knowledge-sync-prune-*.files")
+	if err != nil {
+		return "", fmt.Errorf("create prune target list: %w", err)
+	}
+	name := f.Name()
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(name)
+		}
+	}()
+
+	for _, rel := range relPaths {
+		if err := validatePruneTargetPath(rel); err != nil {
+			return "", err
+		}
+		if _, err := f.WriteString(rel + "\n"); err != nil {
+			return "", fmt.Errorf("write prune target list: %w", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("close prune target list: %w", err)
+	}
+	ok = true
+	return name, nil
+}
+
+func validatePruneTargetPath(rel string) error {
+	if rel == "" || strings.ContainsAny(rel, "\r\n\x00") || strings.HasPrefix(rel, "/") {
+		return fmt.Errorf("unsafe relative path %q", rel)
+	}
+	clean := path.Clean(rel)
+	if clean != rel || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return fmt.Errorf("unsafe relative path %q", rel)
+	}
+	return nil
 }
