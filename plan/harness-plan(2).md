@@ -1,5 +1,7 @@
 # Harness plan: local knowledge sources → Google Drive direct API sync
 
+> Public documentation note: all profile names, filesystem paths, rclone remote names, account labels, folder names, quota values, and identifiers in this document are illustrative examples. They are intentionally generic and must not be interpreted as describing a particular user's environment.
+
 ## 1. Goal and invariants
 
 Build a local macOS harness that mirrors one or more local knowledge sources to Google Drive through the Google Drive API, without Google Drive for desktop and without a mounted Drive filesystem.
@@ -112,26 +114,26 @@ A Go toolchain is required only to build from source. Users installing a prebuil
 
 A profile is the unit of ownership, scheduling, filtering, state, locking, and remote mirroring.
 
-Example:
+Example (illustrative only):
 
 ```text
-profile: obsidian-main
+profile: notes-main
   type: obsidian
-  source: ~/Obsidian/Main
-  rclone remote: gdrive-main
-  remote mirror: ChatGPT Knowledge/Obsidian
+  source: ~/ExampleVault/Main
+  rclone remote: example-drive-primary
+  remote mirror: Knowledge Mirror/Notes
 
 profile: research
   type: generic
-  source: ~/Documents/Research
-  rclone remote: gdrive-secondary
-  remote mirror: ChatGPT Knowledge/Research
+  source: ~/ExampleData/Research
+  rclone remote: example-drive-secondary
+  remote mirror: Knowledge Mirror/Research
 ```
 
 Profile IDs are explicit, stable machine identities, for example:
 
 ```text
-obsidian-main
+notes-main
 research
 project-docs
 ```
@@ -256,8 +258,8 @@ Example on each storage-owner Drive:
   profiles/
     <profile_uuid>.json
 
-ChatGPT Knowledge/
-  Obsidian/
+Knowledge Mirror/
+  Notes/
   Research/
 ```
 
@@ -881,14 +883,14 @@ Every rclone invocation made by the harness must use the intended config rather 
 
 ### Phase C — add profile
 
-Example conceptual command:
+Example conceptual command (illustrative only):
 
 ```zsh
 knowledge-sync profile add \
-  obsidian-main \
-  "/ABSOLUTE/PATH/TO/VAULT" \
-  gdrive-main \
-  "ChatGPT Knowledge/Obsidian" \
+  notes-main \
+  "/ABSOLUTE/PATH/TO/EXAMPLE-VAULT" \
+  example-drive-primary \
+  "Knowledge Mirror/Notes" \
   --type obsidian
 ```
 
@@ -993,10 +995,10 @@ Google Drive capacity belongs to the storage-owner remote, not to an individual 
 
 Track quota per rclone remote.
 
-Example status:
+Example status (illustrative values):
 
 ```text
-gdrive-main
+example-drive-primary
   Used: 13.8 GiB
   Free: 1.2 GiB
   Status: QUOTA_LOW

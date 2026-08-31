@@ -12,6 +12,30 @@
 
 # OAuth credentials and rclone config (never commit secrets)
 rclone.conf
+**/rclone.conf
+credentials.json
+client_secret_*.json
+token.json
+*.credentials.json
+*.oauth.json
+service-account*.json
+*-service-account.json
+application_default_credentials.json
+
+# Environment/local override files
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local.env
+
+# Private keys, certificates, and keystores
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
 
 # Build artifacts
 /bin/
