@@ -6,11 +6,11 @@ on:
       - master
   workflow_dispatch:
 
-# Real cloud tests mutate a shared Drive test area. Serialize runs and let every
-# started run reach its cleanup step instead of cancelling it mid-flight.
+# Every run owns a unique remote path. A newer run cancels an obsolete one and
+# starts by removing stale CI-owned data before creating anything new.
 concurrency:
   group: drive-canary
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -19,7 +19,7 @@ jobs:
   canary:
     name: real-drive-cli-canary
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       CI_RCLONE_CONFIG_B64: ${{ secrets.CI_RCLONE_CONFIG_B64 }}
       PROFILE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -79,10 +79,45 @@ jobs:
           echo "RCLONE_CONFIG=$RCLONE_CFG" >> "$GITHUB_ENV"
           echo "REMOTE_NAME=$REMOTE_NAME" >> "$GITHUB_ENV"
 
-          # The production profile-add path performs the authoritative backend
-          # check. This lightweight probe catches broken/expired credentials
-          # before creating any test objects.
+          # This verifies the secret, credentials and configured root_folder_id
+          # before the canary creates any objects.
           rclone about --config "$RCLONE_CFG" "$REMOTE_NAME:" >/dev/null
+
+      - name: Remove stale CI-owned Drive data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The configured remote is rooted at the dedicated
+          # knowledge-sync-ci-root folder, so this cannot escape the CI area.
+          rclone purge "$REMOTE_NAME:knowledge-sync-ci" >/dev/null 2>&1 || true
+
+          # A cancelled run can also leave a profile sidecar. Remove only
+          # sidecars whose profile_id belongs to the canary namespace.
+          while IFS= read -r name; do
+            [[ "$name" == *.json ]] || continue
+            payload="$(rclone cat "$REMOTE_NAME:.knowledge-sync/profiles/$name" 2>/dev/null)" || continue
+            owner="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("profile_id", ""))' 2>/dev/null)" || continue
+            if [[ "$owner" == ci-* ]]; then
+              rclone deletefile "$REMOTE_NAME:.knowledge-sync/profiles/$name" >/dev/null
+            fi
+          done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)
+
+      - name: Start CLI worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKER_LOG="$RUNNER_TEMP/knowledge-sync-worker.log"
+          ./dist/knowledge-sync worker >"$WORKER_LOG" 2>&1 &
+          WORKER_PID=$!
+          echo "WORKER_PID=$WORKER_PID" >> "$GITHUB_ENV"
+          echo "WORKER_LOG=$WORKER_LOG" >> "$GITHUB_ENV"
+          sleep 1
+          if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+            echo "::error::CLI worker exited during startup"
+            cat "$WORKER_LOG" || true
+            exit 1
+          fi
 
       - name: Create test source tree
         shell: bash
@@ -150,8 +185,7 @@ jobs:
           ./dist/knowledge-sync profile wait "$PROFILE_ID"
 
           # Ignore refresh suppresses the previously managed object but does not
-          # silently authorize deletion. The frozen prune request is the explicit
-          # destructive boundary under test.
+          # silently authorize deletion. Prune is the explicit destructive edge.
           if ! rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'sub/b.md'; then
             echo "sub/b.md disappeared before prune authorization"
             exit 1
@@ -194,6 +228,11 @@ jobs:
           set -uo pipefail
           cleanup_failed=0
 
+          if [[ -n "${WORKER_PID:-}" ]]; then
+            kill "$WORKER_PID" >/dev/null 2>&1 || true
+            wait "$WORKER_PID" >/dev/null 2>&1 || true
+          fi
+
           if [[ -x ./dist/knowledge-sync ]]; then
             ./dist/knowledge-sync profile disable "$PROFILE_ID" >/dev/null 2>&1 || true
           fi
@@ -231,6 +270,11 @@ jobs:
                 cleanup_failed=1
               fi
             done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)
+          fi
+
+          if [[ "$cleanup_failed" -ne 0 && -n "${WORKER_LOG:-}" ]]; then
+            echo "--- worker log ---"
+            cat "$WORKER_LOG" || true
           fi
 
           exit "$cleanup_failed"
