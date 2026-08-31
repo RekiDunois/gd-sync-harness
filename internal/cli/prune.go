@@ -13,7 +13,7 @@ func newPruneCmd() *cobra.Command {
 		Use:   "prune",
 		Short: "Preview and explicitly delete suppressed managed objects",
 	}
-	c.AddCommand(prunePreviewCmd(), pruneExecuteCmd(), pruneStatusCmd())
+	c.AddCommand(prunePreviewCmd(), pruneDiscoverCmd(), pruneExecuteCmd(), pruneStatusCmd())
 	return c
 }
 
