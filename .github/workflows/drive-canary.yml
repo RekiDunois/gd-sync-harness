@@ -182,7 +182,29 @@ jobs:
           set -euo pipefail
           printf '*.tmp\nsub/\n' > "$SOURCE_DIR/.gitignore"
           ./dist/knowledge-sync profile ignore update "$PROFILE_ID"
-          ./dist/knowledge-sync profile wait "$PROFILE_ID"
+
+          REFRESH=""
+          IGNORE_STATUS=""
+          for _ in $(seq 1 60); do
+            IGNORE_STATUS="$(./dist/knowledge-sync profile ignore status "$PROFILE_ID")"
+            REFRESH="$(printf '%s\n' "$IGNORE_STATUS" | awk -F: '/^refresh state:/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')"
+            if [[ "$REFRESH" == "ready" ]]; then
+              break
+            fi
+            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+              echo "::error::CLI worker exited while applying ignore policy"
+              cat "$WORKER_LOG" || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [[ "$REFRESH" != "ready" ]]; then
+            echo "::error::Ignore policy refresh did not reach ready"
+            printf '%s\n' "$IGNORE_STATUS"
+            ./dist/knowledge-sync profile status "$PROFILE_ID" || true
+            cat "$WORKER_LOG" || true
+            exit 1
+          fi
 
           # Ignore refresh suppresses the previously managed object but does not
           # silently authorize deletion. Prune is the explicit destructive edge.
@@ -202,7 +224,8 @@ jobs:
           ./dist/knowledge-sync profile prune execute "$REQUEST_ID" --allow-deletes 10
 
           STATE=""
-          for _ in $(seq 1 90); do
+          STATUS=""
+          for _ in $(seq 1 60); do
             STATUS="$(./dist/knowledge-sync profile prune status "$REQUEST_ID")"
             STATE="$(printf '%s\n' "$STATUS" | awk '/^state:/ {print $2; exit}')"
             if [[ "$STATE" == "completed" ]]; then
@@ -212,14 +235,37 @@ jobs:
               printf '%s\n' "$STATUS"
               exit 1
             fi
+            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+              echo "::error::CLI worker exited while executing prune"
+              cat "$WORKER_LOG" || true
+              exit 1
+            fi
             sleep 2
           done
-          test "$STATE" = "completed"
+          if [[ "$STATE" != "completed" ]]; then
+            echo "::error::Prune did not complete"
+            printf '%s\n' "$STATUS"
+            ./dist/knowledge-sync profile status "$PROFILE_ID" || true
+            cat "$WORKER_LOG" || true
+            exit 1
+          fi
 
           if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'sub/b.md'; then
             echo "suppressed file sub/b.md still exists after prune"
             exit 1
           fi
+
+      - name: Show diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          echo "--- profile status ---"
+          ./dist/knowledge-sync profile status "$PROFILE_ID"
+          echo "--- ignore status ---"
+          ./dist/knowledge-sync profile ignore status "$PROFILE_ID"
+          echo "--- worker log ---"
+          cat "${WORKER_LOG:-/dev/null}"
 
       - name: Cleanup profile and remote test data
         if: always()
@@ -270,11 +316,6 @@ jobs:
                 cleanup_failed=1
               fi
             done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)
-          fi
-
-          if [[ "$cleanup_failed" -ne 0 && -n "${WORKER_LOG:-}" ]]; then
-            echo "--- worker log ---"
-            cat "$WORKER_LOG" || true
           fi
 
           exit "$cleanup_failed"
