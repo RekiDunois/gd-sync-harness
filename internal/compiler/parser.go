@@ -56,18 +56,22 @@ type Parser struct {
 
 func NewParser() *Parser {
 	return &Parser{
-		markdown: goldmark.New(goldmark.WithExtensions(
-			extension.Table,
-			&frontmatter.Extender{},
-			&hashtag.Extender{Variant: hashtag.ObsidianVariant},
-			&wikilink.Extender{},
-		)),
-		plain: goldmark.New(goldmark.WithExtensions(
-			extension.Table,
-			&hashtag.Extender{Variant: hashtag.ObsidianVariant},
-			&wikilink.Extender{},
-		)),
+		markdown: newGoldmark(true),
+		plain:    newGoldmark(false),
 	}
+}
+
+func newGoldmark(withFrontmatter bool) goldmark.Markdown {
+	extenders := []goldmark.Extender{
+		&mathExtender{},
+		extension.Table,
+		&hashtag.Extender{Variant: hashtag.ObsidianVariant},
+		&wikilink.Extender{},
+	}
+	if withFrontmatter {
+		extenders = append(extenders, &frontmatter.Extender{})
+	}
+	return goldmark.New(goldmark.WithExtensions(extenders...))
 }
 
 // Parse returns parser-owned syntax facts. The plain parser pass is used when
