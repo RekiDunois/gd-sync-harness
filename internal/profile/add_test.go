@@ -67,7 +67,7 @@ func TestProfileAddWithMockRemote(t *testing.T) {
 	ctx := context.Background()
 	// Use dry-run first (skips ValidateRemote drive check).
 	p, err := svc.Add(ctx, AddOptions{
-		ID: "obs1", SourcePath: src, RemoteName: "mock", RemotePath: "ChatGPT Knowledge/Obs",
+		ID: "obs1", SourcePath: src, RemoteName: "mock", RemotePath: "Knowledge Mirror/Notes",
 		Type: "obsidian", DryRun: true,
 	})
 	if err != nil {

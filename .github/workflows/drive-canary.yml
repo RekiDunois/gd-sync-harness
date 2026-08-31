@@ -71,7 +71,7 @@ jobs:
           printf '%s' "$CI_RCLONE_CONFIG_B64" | base64 -D > "$RCLONE_CFG"
           chmod 600 "$RCLONE_CFG"
 
-          REMOTES="$(rclone listremotes --config "$RCLONE_CFG")"
+          REMOTES="$(rclone listremotes --config "$RCLONE_CFG" 2>/dev/null)"
           REMOTE_COUNT="$(printf '%s\n' "$REMOTES" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
           if [[ "$REMOTE_COUNT" != "1" ]]; then
             echo "::error::CI rclone config must contain exactly one remote; found $REMOTE_COUNT."
@@ -86,7 +86,7 @@ jobs:
 
           # This verifies the secret, credentials and configured root_folder_id
           # before the canary creates any objects.
-          rclone about --config "$RCLONE_CFG" "$REMOTE_NAME:" >/dev/null
+          rclone about --config "$RCLONE_CFG" "$REMOTE_NAME:" >/dev/null 2>&1
 
       - name: Remove stale CI-owned Drive data
         shell: bash
@@ -104,7 +104,7 @@ jobs:
             payload="$(rclone cat "$REMOTE_NAME:.knowledge-sync/profiles/$name" 2>/dev/null)" || continue
             owner="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("profile_id", ""))' 2>/dev/null)" || continue
             if [[ "$owner" == ci-* ]]; then
-              rclone deletefile "$REMOTE_NAME:.knowledge-sync/profiles/$name" >/dev/null
+              rclone deletefile "$REMOTE_NAME:.knowledge-sync/profiles/$name" >/dev/null 2>&1
             fi
           done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)
 
@@ -120,7 +120,7 @@ jobs:
           sleep 1
           if ! kill -0 "$WORKER_PID" 2>/dev/null; then
             echo "::error::CLI worker exited during startup"
-            cat "$WORKER_LOG" || true
+            echo "Worker diagnostics are withheld because they may contain local or remote identifiers."
             exit 1
           fi
 
@@ -140,9 +140,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./dist/knowledge-sync profile add "$PROFILE_ID" "$SOURCE_DIR" "$REMOTE_NAME" "$REMOTE_PATH" --wait
-          ./dist/knowledge-sync profile status "$PROFILE_ID"
-          PROFILE_UUID="$(./dist/knowledge-sync profile show "$PROFILE_ID" | awk '/^uuid:/ {print $2; exit}')"
+          ./dist/knowledge-sync profile add "$PROFILE_ID" "$SOURCE_DIR" "$REMOTE_NAME" "$REMOTE_PATH" --wait >/dev/null 2>&1
+          ./dist/knowledge-sync profile status "$PROFILE_ID" >/dev/null 2>&1
+          PROFILE_UUID="$(./dist/knowledge-sync profile show "$PROFILE_ID" 2>/dev/null | awk '/^uuid:/ {print $2; exit}')"
           test -n "$PROFILE_UUID"
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
 
@@ -150,13 +150,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/a.md")" = "alpha"
-          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/sub/b.md")" = "beta"
-          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'ignored.tmp'; then
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/a.md" 2>/dev/null)" = "alpha"
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/sub/b.md" 2>/dev/null)" = "beta"
+          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only 2>/dev/null | grep -Fxq 'ignored.tmp'; then
             echo "ignored.tmp was uploaded unexpectedly"
             exit 1
           fi
-          rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only | grep -Fxq "${PROFILE_UUID}.json"
+          rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null | grep -Fxq "${PROFILE_UUID}.json"
 
       - name: Verify update reconciliation
         shell: bash
@@ -164,19 +164,19 @@ jobs:
           set -euo pipefail
           printf 'alpha-v2\n' > "$SOURCE_DIR/a.md"
           printf 'gamma\n' > "$SOURCE_DIR/c.md"
-          ./dist/knowledge-sync sync "$PROFILE_ID"
-          ./dist/knowledge-sync profile wait "$PROFILE_ID"
-          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/a.md")" = "alpha-v2"
-          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/c.md")" = "gamma"
+          ./dist/knowledge-sync sync "$PROFILE_ID" >/dev/null 2>&1
+          ./dist/knowledge-sync profile wait "$PROFILE_ID" >/dev/null 2>&1
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/a.md" 2>/dev/null)" = "alpha-v2"
+          test "$(rclone cat "$REMOTE_NAME:$REMOTE_PATH/c.md" 2>/dev/null)" = "gamma"
 
       - name: Verify normal remote deletion
         shell: bash
         run: |
           set -euo pipefail
           rm "$SOURCE_DIR/c.md"
-          ./dist/knowledge-sync sync "$PROFILE_ID"
-          ./dist/knowledge-sync profile wait "$PROFILE_ID"
-          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'c.md'; then
+          ./dist/knowledge-sync sync "$PROFILE_ID" >/dev/null 2>&1
+          ./dist/knowledge-sync profile wait "$PROFILE_ID" >/dev/null 2>&1
+          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only 2>/dev/null | grep -Fxq 'c.md'; then
             echo "c.md still exists remotely after local deletion and reconciliation"
             exit 1
           fi
@@ -186,19 +186,19 @@ jobs:
         run: |
           set -euo pipefail
           printf '*.tmp\nsub/\n' > "$SOURCE_DIR/.gitignore"
-          ./dist/knowledge-sync profile ignore update "$PROFILE_ID"
+          ./dist/knowledge-sync profile ignore update "$PROFILE_ID" >/dev/null 2>&1
 
           REFRESH=""
           IGNORE_STATUS=""
           for _ in $(seq 1 60); do
-            IGNORE_STATUS="$(./dist/knowledge-sync profile ignore status "$PROFILE_ID")"
+            IGNORE_STATUS="$(./dist/knowledge-sync profile ignore status "$PROFILE_ID" 2>/dev/null)"
             REFRESH="$(printf '%s\n' "$IGNORE_STATUS" | awk -F: '/^refresh state:/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')"
             if [[ "$REFRESH" == "ready" ]]; then
               break
             fi
             if ! kill -0 "$WORKER_PID" 2>/dev/null; then
               echo "::error::CLI worker exited while applying ignore policy"
-              cat "$WORKER_LOG" || true
+              echo "Worker diagnostics are withheld because they may contain local or remote identifiers."
               exit 1
             fi
             sleep 2
@@ -206,19 +206,19 @@ jobs:
           if [[ "$REFRESH" != "ready" ]]; then
             echo "::error::Ignore policy refresh did not reach ready"
             printf '%s\n' "$IGNORE_STATUS"
-            ./dist/knowledge-sync profile status "$PROFILE_ID" || true
-            cat "$WORKER_LOG" || true
+            ./dist/knowledge-sync profile status "$PROFILE_ID" >/dev/null 2>&1 || true
+            echo "Worker diagnostics are withheld because they may contain local or remote identifiers."
             exit 1
           fi
 
           # Ignore refresh suppresses the previously managed object but does not
           # silently authorize deletion. Prune is the explicit destructive edge.
-          if ! rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'sub/b.md'; then
+          if ! rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only 2>/dev/null | grep -Fxq 'sub/b.md'; then
             echo "sub/b.md disappeared before prune authorization"
             exit 1
           fi
 
-          PREVIEW="$(./dist/knowledge-sync profile prune preview "$PROFILE_ID")"
+          PREVIEW="$(./dist/knowledge-sync profile prune preview "$PROFILE_ID" 2>/dev/null)"
           printf '%s\n' "$PREVIEW"
           REQUEST_ID="$(printf '%s\n' "$PREVIEW" | sed -n 's/^prune preview #//p' | head -n1)"
           CANDIDATES="$(printf '%s\n' "$PREVIEW" | sed -n 's/^candidate set: \([0-9][0-9]*\) suppressed object(s)$/\1/p' | head -n1)"
@@ -226,36 +226,36 @@ jobs:
           test -n "$CANDIDATES"
           test "$CANDIDATES" -ge 1
 
-          ./dist/knowledge-sync profile prune execute "$REQUEST_ID" --allow-deletes 10
+          ./dist/knowledge-sync profile prune execute "$REQUEST_ID" --allow-deletes 10 >/dev/null 2>&1
 
           STATE=""
           STATUS=""
           for _ in $(seq 1 60); do
-            STATUS="$(./dist/knowledge-sync profile prune status "$REQUEST_ID")"
+            STATUS="$(./dist/knowledge-sync profile prune status "$REQUEST_ID" 2>/dev/null)"
             STATE="$(printf '%s\n' "$STATUS" | awk '/^state:/ {print $2; exit}')"
             if [[ "$STATE" == "completed" ]]; then
               break
             fi
             if [[ "$STATE" == "failed" || "$STATE" == "aborted" ]]; then
-              printf '%s\n' "$STATUS"
+              echo "Prune diagnostics are withheld because they may contain local or remote identifiers."
               exit 1
             fi
             if ! kill -0 "$WORKER_PID" 2>/dev/null; then
               echo "::error::CLI worker exited while executing prune"
-              cat "$WORKER_LOG" || true
+              echo "Worker diagnostics are withheld because they may contain local or remote identifiers."
               exit 1
             fi
             sleep 2
           done
           if [[ "$STATE" != "completed" ]]; then
             echo "::error::Prune did not complete"
-            printf '%s\n' "$STATUS"
-            ./dist/knowledge-sync profile status "$PROFILE_ID" || true
-            cat "$WORKER_LOG" || true
+            echo "Prune diagnostics are withheld because they may contain local or remote identifiers."
+            ./dist/knowledge-sync profile status "$PROFILE_ID" >/dev/null 2>&1 || true
+            echo "Worker diagnostics are withheld because they may contain local or remote identifiers."
             exit 1
           fi
 
-          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only | grep -Fxq 'sub/b.md'; then
+          if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only 2>/dev/null | grep -Fxq 'sub/b.md'; then
             echo "suppressed file sub/b.md still exists after prune"
             exit 1
           fi
@@ -265,12 +265,10 @@ jobs:
         shell: bash
         run: |
           set +e
-          echo "--- profile status ---"
-          ./dist/knowledge-sync profile status "$PROFILE_ID"
+          echo "--- profile status omitted to avoid exposing local or remote identifiers ---"
           echo "--- ignore status ---"
-          ./dist/knowledge-sync profile ignore status "$PROFILE_ID"
-          echo "--- worker log ---"
-          cat "${WORKER_LOG:-/dev/null}"
+          ./dist/knowledge-sync profile ignore status "$PROFILE_ID" 2>/dev/null || true
+          echo "--- worker log omitted to avoid exposing local or remote identifiers ---"
 
       - name: Cleanup profile and remote test data
         if: always()
@@ -306,8 +304,7 @@ jobs:
 
             if rclone lsf "$REMOTE_NAME:$REMOTE_PATH" --recursive --files-only >/tmp/ks-ci-leftovers 2>/dev/null; then
               if [[ -s /tmp/ks-ci-leftovers ]]; then
-                echo "::error::Remote canary data remains after cleanup:"
-                cat /tmp/ks-ci-leftovers
+                echo "::error::Remote canary data remains after cleanup; object listing withheld."
                 cleanup_failed=1
               fi
             fi
@@ -317,7 +314,7 @@ jobs:
               payload="$(rclone cat "$REMOTE_NAME:.knowledge-sync/profiles/$name" 2>/dev/null)" || continue
               owner="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("profile_id", ""))' 2>/dev/null)" || continue
               if [[ "$owner" == "$PROFILE_ID" ]]; then
-                echo "::error::Sidecar $name remains after cleanup"
+                echo "::error::A CI-owned sidecar remains after cleanup."
                 cleanup_failed=1
               fi
             done < <(rclone lsf "$REMOTE_NAME:.knowledge-sync/profiles" --files-only 2>/dev/null)

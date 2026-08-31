@@ -11,15 +11,15 @@ import (
 func TestWatchPlistRender(t *testing.T) {
 	c := Config{
 		LabelPrefix: "com.local.knowledge-sync",
-		ProfileID:   "obsidian-main",
+		ProfileID:   "example-profile",
 		Kind:        JobWatch,
 		Binary:      "/usr/local/bin/knowledge-sync",
-		LogDir:      "/Users/x/Library/Logs/knowledge-sync",
+		LogDir:      filepath.Join(t.TempDir(), "logs"),
 	}
-	if c.Label() != "com.local.knowledge-sync.obsidian-main.watch" {
+	if c.Label() != "com.local.knowledge-sync.example-profile.watch" {
 		t.Fatalf("label = %s", c.Label())
 	}
-	if c.PlistFilename() != "com.local.knowledge-sync.obsidian-main.watch.plist" {
+	if c.PlistFilename() != "com.local.knowledge-sync.example-profile.watch.plist" {
 		t.Fatalf("filename = %s", c.PlistFilename())
 	}
 	b, err := c.Render()
@@ -29,10 +29,10 @@ func TestWatchPlistRender(t *testing.T) {
 	s := string(b)
 	for _, want := range []string{
 		"<key>Label</key>",
-		"com.local.knowledge-sync.obsidian-main.watch",
+		"com.local.knowledge-sync.example-profile.watch",
 		"/usr/local/bin/knowledge-sync",
 		"watch",
-		"obsidian-main",
+		"example-profile",
 		"<key>RunAtLoad</key>",
 		"<true/>",
 		"<key>KeepAlive</key>",
@@ -49,10 +49,10 @@ func TestWatchPlistRender(t *testing.T) {
 func TestReconcilePlistRender(t *testing.T) {
 	c := Config{
 		LabelPrefix:   "com.local.knowledge-sync",
-		ProfileID:     "obsidian-main",
+		ProfileID:     "example-profile",
 		Kind:          JobReconcile,
 		Binary:        "/usr/local/bin/knowledge-sync",
-		LogDir:        "/Users/x/Library/Logs/knowledge-sync",
+		LogDir:        filepath.Join(t.TempDir(), "logs"),
 		ReconcileHour: 13,
 		ReconcileMin:  37,
 	}
@@ -87,7 +87,7 @@ func TestWorkerLabelAndPlistRender(t *testing.T) {
 		ProfileID:   "",
 		Kind:        JobWorker,
 		Binary:      "/usr/local/bin/knowledge-sync",
-		LogDir:      "/Users/x/Library/Logs/knowledge-sync",
+		LogDir:      filepath.Join(t.TempDir(), "logs"),
 	}
 	if c.Label() != "com.local.knowledge-sync.worker" {
 		t.Fatalf("worker label = %q", c.Label())
