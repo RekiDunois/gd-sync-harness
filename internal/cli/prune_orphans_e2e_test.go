@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -139,8 +141,8 @@ func TestMissingSuppressedTargetClearsManifestOwnership(t *testing.T) {
 	if err := runWorkerPass(nil, app, "", nil); err != nil {
 		t.Fatalf("prune missing target: %v", err)
 	}
-	if _, err := app.DB.ManifestGet(p.ID, "a.md"); err != state.ErrNotFound {
-		t.Fatalf("manifest lookup err = %v, want ErrNotFound", err)
+	if _, err := app.DB.ManifestGet(p.ID, "a.md"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("manifest lookup err = %v, want sql.ErrNoRows", err)
 	}
 }
 
