@@ -187,4 +187,14 @@ When asked to commit changes:
 6. If the repository may be public and safety is uncertain, stop before the commit and report the questionable value/category without reproducing secrets.
 7. Never "fix it in the next commit" when the problem can be prevented before the current commit.
 
+## Parallel Development
+
+When multiple agents work on this repository, use Git worktrees instead of
+sharing one working directory.
+
+- Store secondary worktrees in a sibling `worktrees/` directory next to the primary checkout, using one directory per agent or branch. Interpret this location relative to the primary checkout, not the current worktree.
+- Each agent must operate from its own worktree directory.
+- Keep each worktree on its own branch; do not switch branches in another agent's worktree.
+- Before removing a worktree, confirm that its changes have been committed or intentionally discarded.
+
 These rules take precedence over convenience and over preserving incidental local details in debugging narratives.
