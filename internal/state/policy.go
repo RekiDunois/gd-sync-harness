@@ -235,8 +235,33 @@ func (d *DB) CommitIgnoreSnapshot(profileID string, snap *policy.Snapshot, accep
 
 	now := Now()
 	nowStr := now.Format(timeFmt)
-	// Advance the unified input generation exactly once (§7.1).
-	gen := cur.generation + 1
+
+	// Advance the unified input generation exactly once (§7.1). Policy
+	// generations share the same monotonic namespace as reconciliation intent.
+	// Manual/scheduled reconciliation can move desired_generation ahead without
+	// changing the policy row, so deriving the next value only from the prior
+	// committed policy generation can create no debt at all. Allocate strictly
+	// above every durable generation marker that can already have been observed.
+	var sourceGeneration, desiredGeneration int64
+	var lastSuccessGeneration sql.NullInt64
+	if err := tx.QueryRow(`SELECT r.source_generation, s.desired_generation, s.last_success_generation
+		FROM profile_runtime r
+		JOIN profile_sync_state s ON s.profile_id = r.profile_id
+		WHERE r.profile_id = ?`, profileID).
+		Scan(&sourceGeneration, &desiredGeneration, &lastSuccessGeneration); err != nil {
+		return nil, err
+	}
+	baseGeneration := cur.generation
+	if sourceGeneration > baseGeneration {
+		baseGeneration = sourceGeneration
+	}
+	if desiredGeneration > baseGeneration {
+		baseGeneration = desiredGeneration
+	}
+	if lastSuccessGeneration.Valid && lastSuccessGeneration.Int64 > baseGeneration {
+		baseGeneration = lastSuccessGeneration.Int64
+	}
+	gen := baseGeneration + 1
 	if _, err := tx.Exec(`UPDATE profile_runtime SET source_generation = ? WHERE profile_id = ?`, gen, profileID); err != nil {
 		return nil, err
 	}
@@ -273,17 +298,23 @@ func (d *DB) CommitIgnoreSnapshot(profileID string, snap *policy.Snapshot, accep
 
 	// Advance desired_generation so the worker refreshes the new policy (§7.2).
 	// A policy commit changes eligibility but is non-destructive (suppressed
-	// objects are protected), so it does not impose the destructive debounce
-	// window; refresh debt is immediately claimable.
+	// objects are protected), so it does not impose a new destructive debounce
+	// window. If a one-shot manual intent is still pending, carry its generation
+	// forward so its execution metadata is consumed by the coalesced run rather
+	// than becoming stranded on an older generation.
 	if _, err := tx.Exec(`UPDATE profile_sync_state SET
 		desired_generation = MAX(desired_generation, ?),
+		pending_manual_generation = CASE
+			WHEN pending_manual_generation IS NULL THEN NULL
+			ELSE ?
+		END,
 		state = CASE
 			WHEN state = ? THEN state
 			WHEN last_success_generation IS NULL THEN ?
 			ELSE ?
 		END
 		WHERE profile_id = ?`,
-		gen, StateError, StateInitializing, StateSyncing, profileID); err != nil {
+		gen, gen, StateError, StateInitializing, StateSyncing, profileID); err != nil {
 		return nil, err
 	}
 
