@@ -94,7 +94,7 @@ files_completed / (now - run.started_at)
 建议最终 status 输出：
 
 ```text
-Profile: obsidian-main
+Profile: example-profile
 State:   syncing
 Phase:   uploading
 Run:     ...
@@ -1203,7 +1203,7 @@ reserved flag "--max-delete"
 启动 worker，观察：
 
 ```bash
-knowledge-sync profile status obsidian-main --watch
+knowledge-sync profile status example-profile --watch
 ```
 
 期望出现：

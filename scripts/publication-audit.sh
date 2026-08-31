@@ -58,6 +58,7 @@ fi
 secret_value_re='(AIza[0-9A-Za-z_-]{35}|gh[pousr]_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{20,}|AKIA[0-9A-Z]{16}|1//[0-9A-Za-z_-]{20,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)'
 privacy_re='(/Users/[^/[:space:]]+|/home/[^/[:space:]]+|[A-Za-z0-9._%+-]+@(gmail\.com|icloud\.com|outlook\.com|hotmail\.com))'
 credential_file_re='(^|/)(rclone\.conf|credentials\.json|token\.json|client_secret_[^/]+\.json|[^/]*service-account[^/]*\.json|application_default_credentials\.json|[^/]+\.(pem|key|p12|pfx|jks|keystore))$'
+privacy_exclude_paths=(':(exclude)AGENTS.md' ':(exclude)AGENT.md' ':(exclude)scripts/publication-audit.sh')
 
 fail=0
 warn=0
@@ -91,7 +92,7 @@ report_current() {
     echo "OK: no high-confidence credential value shapes in tracked files"
   fi
 
-  git grep -Il -E "$privacy_re" -- . >"$tmp/current-privacy" 2>/dev/null || true
+  git grep -Il -E "$privacy_re" -- . "${privacy_exclude_paths[@]}" >"$tmp/current-privacy" 2>/dev/null || true
   if [[ -s "$tmp/current-privacy" ]]; then
     echo "WARN: personal path/email shape found in tracked files; review these paths:"
     sed 's/^/  /' "$tmp/current-privacy"
@@ -134,7 +135,7 @@ report_history() {
 
     while IFS= read -r path; do
       [[ -n "$path" ]] && printf '%s:%s\n' "$rev" "$path" >>"$tmp/history-privacy"
-    done < <(git grep -Il -E "$privacy_re" "$rev" -- . 2>/dev/null || true)
+    done < <(git grep -Il -E "$privacy_re" "$rev" -- . "${privacy_exclude_paths[@]}" 2>/dev/null || true)
 
     msg="$(git show -s --format='%B' "$rev")"
     if printf '%s\n' "$msg" | grep -Eq "$secret_value_re"; then

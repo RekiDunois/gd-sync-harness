@@ -20,7 +20,7 @@ func TestProfileLifecycleTombstone(t *testing.T) {
 	p := &Profile{
 		ID: "obs", ProfileUUID: "uuid-1", Type: "obsidian",
 		SourcePath: "/vault", RemoteName: "gdrive", RemoteFolderID: "f1",
-		RemoteDisplayPath: "ChatGPT Knowledge/Obsidian", Enabled: true,
+		RemoteDisplayPath: "Knowledge Mirror/Notes", Enabled: true,
 		MaxDelete: 100, MaxFileSize: 512 << 20,
 	}
 	if err := db.CreateProfile(p); err != nil {

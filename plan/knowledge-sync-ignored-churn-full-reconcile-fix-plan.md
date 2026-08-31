@@ -46,7 +46,7 @@ if full || !last.Valid || desired > last.Int64 || current.Valid {
 
 ## 2. 已验证现场
 
-现场 profile：`obsidian-main`。
+现场 profile：`example-profile`。
 
 Committed ignore policy：
 
@@ -907,14 +907,14 @@ go test -race ./...
 
 ## 13. 现场复现与验收脚本
 
-实现后在真实 `obsidian-main` 上做一次最小验证。
+实现后在专用测试 profile `example-profile` 上做一次最小验证。
 
 ### 13.1 前置条件
 
 确认：
 
 ```bash
-./bin/knowledge-sync profile ignore status obsidian-main
+./bin/knowledge-sync profile ignore status example-profile
 ```
 
 应显示：
@@ -1000,7 +1000,7 @@ event promote full: profile=... path=... kind=rename generation=...
 batch summary 示例：
 
 ```text
-fast event batch obsidian-main: pending=7 eligible=2 excluded=4 stale=1
+fast event batch example-profile: pending=7 eligible=2 excluded=4 stale=1
 ```
 
 这样下一次看到 generation 变化时，不必靠 manifest mtime 反推事件来源。
@@ -1071,7 +1071,7 @@ fast event batch obsidian-main: pending=7 eligible=2 excluded=4 stale=1
 - [ ] active same-path size/mtime change 能改变 fingerprint。
 - [ ] full test suite 通过。
 - [ ] race tests 通过。
-- [ ] 真实 `obsidian-main` 验证不再复现“full 成功 5 秒后仅因 ignored safe churn 再 claim full”的模式。
+- [ ] 专用测试 profile `example-profile` 验证不再复现“full 成功 5 秒后仅因 ignored safe churn 再 claim full”的模式。
 
 ---
 

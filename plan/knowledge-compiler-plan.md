@@ -458,7 +458,7 @@ compiler/<profile_uuid>/MANIFEST.json
 ```json
 {
   "schema_version": 1,
-  "profile_id": "obsidian-main",
+  "profile_id": "example-profile",
   "profile_uuid": "...",
   "current_generation_id": "uuid-C",
   "generation_manifest_path": "generations/uuid-C/MANIFEST.json",
