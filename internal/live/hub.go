@@ -31,6 +31,8 @@ type Hub struct {
 type subscriber struct {
 	profileID string
 	ch        chan StatusSnapshot
+	ready     bool
+	pending   *StatusSnapshot
 }
 
 // NewHub builds an empty hub.
@@ -41,24 +43,67 @@ func NewHub() *Hub {
 // Subscribe registers a subscriber for a profile and returns a channel that
 // receives full replacement snapshots.
 func (h *Hub) Subscribe(profileID string) <-chan StatusSnapshot {
-	ch := make(chan StatusSnapshot, 1)
+	sub := h.beginSubscribe(profileID)
+	h.finishSubscribe(sub, nil)
+	return sub.ch
+}
+
+func (h *Hub) beginSubscribe(profileID string) *subscriber {
+	sub := &subscriber{profileID: profileID, ch: make(chan StatusSnapshot, 1)}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.subscribers[profileID] = append(h.subscribers[profileID], &subscriber{profileID: profileID, ch: ch})
-	return ch
+	h.subscribers[profileID] = append(h.subscribers[profileID], sub)
+	h.mu.Unlock()
+	return sub
+}
+
+// finishSubscribe completes the initial-snapshot handoff. A publish that
+// races with the initial read/write is held until after the initial frame and
+// re-versioned so the client observes monotonic sequence numbers.
+func (h *Hub) finishSubscribe(sub *subscriber, restamp func(StatusSnapshot) StatusSnapshot) {
+	h.mu.Lock()
+	if sub.pending != nil {
+		pending := *sub.pending
+		if restamp != nil {
+			pending = restamp(pending)
+		}
+		sub.ch <- pending
+		sub.pending = nil
+	}
+	sub.ready = true
+	h.mu.Unlock()
+}
+
+func (h *Hub) cancelSubscribe(sub *subscriber) {
+	h.removeSubscriber(sub)
 }
 
 // Unsubscribe removes a subscriber channel.
 func (h *Hub) Unsubscribe(profileID string, ch <-chan StatusSnapshot) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	subs := h.subscribers[profileID]
 	for i, s := range subs {
 		if s.ch == ch {
-			h.subscribers[profileID] = append(subs[:i], subs[i+1:]...)
+			h.removeSubscriberLocked(profileID, i)
 			break
 		}
 	}
+	h.mu.Unlock()
+}
+
+func (h *Hub) removeSubscriber(sub *subscriber) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, candidate := range h.subscribers[sub.profileID] {
+		if candidate == sub {
+			h.removeSubscriberLocked(sub.profileID, i)
+			return
+		}
+	}
+}
+
+func (h *Hub) removeSubscriberLocked(profileID string, index int) {
+	subs := h.subscribers[profileID]
+	h.subscribers[profileID] = append(subs[:index], subs[index+1:]...)
 	if len(h.subscribers[profileID]) == 0 {
 		delete(h.subscribers, profileID)
 	}
@@ -71,6 +116,11 @@ func (h *Hub) Publish(s StatusSnapshot) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, sub := range h.subscribers[s.ProfileID] {
+		if !sub.ready {
+			pending := s
+			sub.pending = &pending
+			continue
+		}
 		select {
 		case sub.ch <- s:
 		default:

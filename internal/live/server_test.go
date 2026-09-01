@@ -28,10 +28,11 @@ func shortTempDir(t *testing.T) string {
 // fakeReader is a scripted DurableReader that returns snapshots for registered
 // profiles and records refresh calls.
 type fakeReader struct {
-	mu        sync.Mutex
-	profiles  map[string]bool
-	refreshes int
-	activity  *ActivityS
+	mu         sync.Mutex
+	profiles   map[string]bool
+	refreshes  int
+	activity   *ActivityS
+	afterBuild func()
 }
 
 func newFakeReader(profiles ...string) *fakeReader {
@@ -44,21 +45,28 @@ func newFakeReader(profiles ...string) *fakeReader {
 
 func (r *fakeReader) BuildSnapshot(profileID string, activity *ActivityS) *StatusSnapshot {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if !r.profiles[profileID] {
+		r.mu.Unlock()
 		return nil
 	}
 	if activity == nil {
 		activity = r.activity
 	}
 	lsg := int64(3)
-	return &StatusSnapshot{
+	snapshot := &StatusSnapshot{
 		ProfileID: profileID,
 		Profile:   ProfileS{Enabled: true},
 		Sync: SyncS{Initialized: true, State: "ready", DesiredGeneration: 3,
 			LastSuccessGeneration: &lsg},
 		Activity: activity,
 	}
+	hook := r.afterBuild
+	r.afterBuild = nil
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return snapshot
 }
 
 func (r *fakeReader) Refresh(profileID string) bool {
@@ -218,6 +226,37 @@ func TestMultipleSubscribersReceiveSameLatestStatus(t *testing.T) {
 	}
 	if sB2.Activity == nil || sB2.Activity.Kind != ActivityFullReconcile {
 		t.Fatalf("subscriber B activity = %+v", sB2.Activity)
+	}
+}
+
+func TestSubscribeHandoffDeliversPublishDuringInitialBuild(t *testing.T) {
+	srv, reader, path := startTestServer(t, "example-profile")
+	built := make(chan struct{})
+	release := make(chan struct{})
+	reader.mu.Lock()
+	reader.afterBuild = func() {
+		close(built)
+		<-release
+	}
+	reader.mu.Unlock()
+
+	conn, r := dial(t, path)
+	send(t, conn, Subscribe{ProfileID: "example-profile"})
+	<-built
+	ready := int64(4)
+	srv.publish(StatusSnapshot{
+		ProfileID: "example-profile",
+		Sync:      SyncS{State: "ready", LastSuccessGeneration: &ready},
+	})
+	close(release)
+
+	initial := readStatus(t, r)
+	latest := readStatus(t, r)
+	if latest.Sync.State != "ready" || latest.Sync.LastSuccessGeneration == nil || *latest.Sync.LastSuccessGeneration != ready {
+		t.Fatalf("latest snapshot = %+v, want ready generation %d", latest.Sync, ready)
+	}
+	if latest.SnapshotSeq <= initial.SnapshotSeq {
+		t.Fatalf("snapshot sequence regressed: initial=%d latest=%d", initial.SnapshotSeq, latest.SnapshotSeq)
 	}
 }
 

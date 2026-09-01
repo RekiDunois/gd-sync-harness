@@ -25,11 +25,12 @@ type Server struct {
 	clock     SampleClock
 	log       *log.Logger
 
-	mu       sync.Mutex
-	listener net.Listener
-	conns    map[net.Conn]struct{}
-	wg       sync.WaitGroup
-	closed   bool
+	mu        sync.Mutex
+	listener  net.Listener
+	conns     map[net.Conn]struct{}
+	wg        sync.WaitGroup
+	closed    bool
+	publishMu sync.Mutex
 }
 
 // ServerOptions configures a Server.
@@ -182,6 +183,8 @@ func (s *Server) PublishDurableRefresh(profileID string) {
 }
 
 func (s *Server) publish(snapshot StatusSnapshot) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
 	s.hub.Publish(s.versioned(snapshot))
 }
 
@@ -233,27 +236,38 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) handleSubscribe(conn net.Conn, msg *Message, done <-chan struct{}) {
-	sub := Subscribe{}
-	if err := json.Unmarshal(msg.Payload, &sub); err != nil || sub.ProfileID == "" {
+	request := Subscribe{}
+	if err := json.Unmarshal(msg.Payload, &request); err != nil || request.ProfileID == "" {
 		resp, _ := encodeError(msg.ProfileID, ErrCodeBadRequest, "malformed subscribe request")
 		_ = writeLine(conn, resp)
 		return
 	}
+	// Register a paused subscriber before the durable read. Publishes during the
+	// initial read/write are retained and delivered after the direct snapshot.
+	sub := s.hub.beginSubscribe(request.ProfileID)
+	active := false
+	defer func() {
+		if active {
+			s.hub.Unsubscribe(request.ProfileID, sub.ch)
+		} else {
+			s.hub.cancelSubscribe(sub)
+		}
+	}()
+
 	// One fresh durable read for this profile, then an immediate full snapshot
 	// (§6.4). The subscriber must not wait for the next rclone frame. The
 	// initial snapshot is written directly to this connection (not broadcast
 	// through the hub, so other subscribers are not spammed with it).
-	s.reader.Refresh(sub.ProfileID)
-	snapshot := s.reader.BuildSnapshot(sub.ProfileID, nil)
+	s.reader.Refresh(request.ProfileID)
+	snapshot := s.reader.BuildSnapshot(request.ProfileID, nil)
 	if snapshot == nil {
-		resp, _ := encodeError(sub.ProfileID, ErrCodeUnknownProfile, "no such profile")
+		resp, _ := encodeError(request.ProfileID, ErrCodeUnknownProfile, "no such profile")
 		_ = writeLine(conn, resp)
 		return
 	}
-	ch := s.hub.Subscribe(sub.ProfileID)
-	defer s.hub.Unsubscribe(sub.ProfileID, ch)
-
+	s.publishMu.Lock()
 	initial := s.versioned(*snapshot)
+	s.publishMu.Unlock()
 	b, err := statusPayload(initial)
 	if err != nil {
 		return
@@ -261,9 +275,15 @@ func (s *Server) handleSubscribe(conn net.Conn, msg *Message, done <-chan struct
 	if err := writeLine(conn, b); err != nil {
 		return
 	}
+	s.publishMu.Lock()
+	s.hub.finishSubscribe(sub, func(snapshot StatusSnapshot) StatusSnapshot {
+		return s.versioned(snapshot)
+	})
+	s.publishMu.Unlock()
+	active = true
 	for {
 		select {
-		case sn, ok := <-ch:
+		case sn, ok := <-sub.ch:
 			if !ok {
 				return
 			}
