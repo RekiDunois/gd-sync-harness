@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - master
+  schedule:
+    - cron: '17 3 * * 1'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -84,3 +86,89 @@ jobs:
           set -euo pipefail
           git diff --exit-code
           test -z "$(git status --porcelain --untracked-files=all)"
+
+  coverage:
+    name: coverage
+    # Coverage is informational until the metrics and package floors have been
+    # calibrated. The verify job remains the correctness gate.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Package-local coverage
+        run: go test -count=1 -coverprofile=coverage-package.out ./...
+
+      - name: Cross-package coverage
+        run: go test -count=1 -coverpkg=./... -coverprofile=coverage-cross.out ./...
+
+      - name: Render coverage summaries
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## Go coverage'
+            for profile in coverage-package coverage-cross; do
+              summary="${profile}.txt"
+              echo "### ${profile}"
+              if [[ -f "${profile}.out" ]]; then
+                go tool cover -func="${profile}.out" | tee "${summary}"
+                echo '```text'
+                cat "${summary}"
+                echo '```'
+              else
+                printf '%s\n' 'Profile was not generated.' | tee "${summary}"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: |
+            coverage-package.out
+            coverage-package.txt
+            coverage-cross.out
+            coverage-cross.txt
+          if-no-files-found: warn
+
+  race:
+    name: race (weekly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Race test suite
+        run: go test -race ./...
