@@ -21,6 +21,12 @@ type phase3CLIFixture struct {
 // source tree, and local mock remote. Commands still enter through NewRootCmd.
 func newPhase3CLIFixture(t *testing.T, id string) *phase3CLIFixture {
 	t.Helper()
+	fakeLaunchctl := t.TempDir()
+	launchctlPath := filepath.Join(fakeLaunchctl, "launchctl")
+	if err := os.WriteFile(launchctlPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeLaunchctl+string(os.PathListSeparator)+os.Getenv("PATH"))
 	bin, err := osexec.LookPath("rclone")
 	if err != nil {
 		t.Skip("rclone not installed")
@@ -264,19 +270,14 @@ func TestPhase3CLIVerifyReconcileWorkerAndCompiler(t *testing.T) {
 }
 
 func TestPhase3StatusFormattingAndHealthBoundaries(t *testing.T) {
-	f := newPhase3CLIFixture(t, "cli-health")
-	db := openPhase3DB(t, f)
-	rt, err := db.GetRuntime(f.profile.ID)
+	db, err := state.Open(filepath.Join(t.TempDir(), "health.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss, err := db.GetSyncState(f.profile.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseProfile := *f.profile
-	baseRuntime := *rt
-	baseSync := *ss
+	t.Cleanup(func() { _ = db.Close() })
+	baseProfile := state.Profile{ID: "health", RemoteName: "health-remote", Enabled: true}
+	baseRuntime := state.Runtime{}
+	baseSync := state.ProfileSyncState{}
 	old := time.Now().Add(-48 * time.Hour).UTC().Format("2006-01-02T15:04:05.000Z07:00")
 	lastError := "failed"
 	baseSync.State = state.StateReady
@@ -312,7 +313,7 @@ func TestPhase3StatusFormattingAndHealthBoundaries(t *testing.T) {
 			if quota == "" {
 				quota = state.QuotaOK
 			}
-			if err := db.UpsertRemote(&state.Remote{RemoteName: f.profile.RemoteName, QuotaStatus: quota}); err != nil {
+			if err := db.UpsertRemote(&state.Remote{RemoteName: baseProfile.RemoteName, QuotaStatus: quota}); err != nil {
 				t.Fatal(err)
 			}
 			if got := computeHealth(&App{DB: db}, &tc.profile, tc.runtime, tc.sync); got != tc.want {
