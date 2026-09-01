@@ -65,6 +65,34 @@ func TestProfileLifecycleTombstone(t *testing.T) {
 	}
 }
 
+func TestProfileRestoreClearsDeletionIntent(t *testing.T) {
+	db := openTestDB(t)
+	p := &Profile{
+		ID: "restore", ProfileUUID: "restore-uuid", Type: "generic",
+		SourcePath: "/source", RemoteName: "remote", RemoteFolderID: "folder",
+		RemoteDisplayPath: "mirror", Enabled: true,
+	}
+	if err := db.CreateProfile(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RequestProfileDeletion(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.TombstoneProfile(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RestoreProfile(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetProfile(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Tombstoned || got.DeletedAt != nil || got.DeletionRequestedAt != nil {
+		t.Fatalf("restored profile retained deletion state: %+v", got)
+	}
+}
+
 func TestPendingEventsUpsert(t *testing.T) {
 	db := openTestDB(t)
 	p := &Profile{ID: "p1", ProfileUUID: "u1", Type: "generic",
