@@ -14,8 +14,19 @@ func TestPriorityOrdering(t *testing.T) {
 	var order []string
 	var mu sync.Mutex
 
-	// Submit jobs with different priorities before any run (concurrency 1 so
-	// only one runs at a time). Higher priority should be dequeued first.
+	// Hold the only slot while the jobs are submitted. Submit starts work
+	// asynchronously, so without this barrier the first job could run before
+	// the later, higher-priority jobs reach the queue.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	blockerDone := s.Submit(ctx, Job{Remote: "r", Priority: 100, Run: func(context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}})
+	<-started
+
+	// Once all jobs are queued, higher priority should be dequeued first.
 	done := make([]chan error, 4)
 	done[0] = s.Submit(ctx, Job{Remote: "r", Priority: 1, Run: func(ctx context.Context) error {
 		mu.Lock()
@@ -42,6 +53,8 @@ func TestPriorityOrdering(t *testing.T) {
 		return nil
 	}})
 
+	close(release)
+	<-blockerDone
 	for _, d := range done {
 		<-d
 	}

@@ -43,6 +43,8 @@ application_default_credentials.json
 *.dylib
 *.test
 coverage.out
+coverage-package.out
+coverage-cross.out
 
 # macOS
 .DS_Store
