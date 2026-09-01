@@ -2,6 +2,8 @@ package sync
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -262,6 +264,44 @@ func (s *Service) VerifyFull(ctx context.Context, p *state.Profile) error {
 		return fmt.Errorf("verify full: %w: %s", res.Err, res.StderrTrimmed())
 	}
 	return nil
+}
+
+func (s *Service) remoteDuplicates(ctx context.Context, p *state.Profile) (bool, error) {
+	res := s.Rclone.Run(ctx, "lsjson", "--recursive",
+		p.RemoteName+":"+p.RemoteDisplayPath)
+	if res.Err != nil {
+		var exitErr interface{ ExitCode() int }
+		if errors.As(res.Err, &exitErr) && exitErr.ExitCode() == 3 {
+			return false, nil
+		}
+		return false, fmt.Errorf("duplicate check: %w: %s", res.Err, res.StderrTrimmed())
+	}
+	var entries []struct {
+		Path  string `json:"Path"`
+		Name  string `json:"Name"`
+		IsDir bool   `json:"IsDir"`
+	}
+	if err := json.Unmarshal(res.Stdout, &entries); err != nil {
+		return false, fmt.Errorf("duplicate check parse: %w", err)
+	}
+	counts := make(map[string]int, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir {
+			continue
+		}
+		key := entry.Path
+		if key == "" {
+			key = entry.Name
+		}
+		if key == "" {
+			continue
+		}
+		counts[key]++
+		if counts[key] > 1 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // loadCommittedSnapshot reads the validated committed policy snapshot for a

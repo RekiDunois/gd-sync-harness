@@ -89,6 +89,17 @@ func (r *Reconciler) PreflightProtected(ctx context.Context, p *state.Profile, s
 		return nil, err
 	}
 	fp1 := fingerprintActiveEntries(active1)
+	duplicates, err := r.Service.remoteDuplicates(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	if duplicates {
+		return &PreflightResult{
+			SourceFiles:       len(active1),
+			RemoteDup:         true,
+			SourceFingerprint: fp1,
+		}, nil
+	}
 
 	dry, err := r.Service.DryRunSyncProtected(ctx, p, snap, options)
 	if err != nil {
