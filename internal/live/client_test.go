@@ -61,16 +61,19 @@ func TestObserverProtocolMismatchFallsBack(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			// Send an incompatible subscribe then a valid one; the server
-			// replies protocol_mismatch and closes. The client must surface
-			// ErrUnavailable, not panic.
+			// Send an incompatible subscribe; the server replies
+			// protocol_mismatch and closes. Depending on scheduling, the client
+			// observes ErrUnavailable during Connect or on the first read.
 			conn.Write([]byte(`{"protocol_version":99,"type":"subscribe","payload":{}` + "\n"))
 			return conn, nil
 		},
 	}
 	stream, err := obs.Connect()
 	if err != nil {
-		t.Fatal(err)
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("connect error = %v, want ErrUnavailable", err)
+		}
+		return
 	}
 	defer stream.Close()
 	_, err = stream.Next()
