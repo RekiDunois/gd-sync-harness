@@ -149,7 +149,15 @@ func (s *Server) acceptLoop(l net.Listener) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		s.conns[conn] = struct{}{}
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go s.handleConn(conn)
 	}
 }
@@ -179,9 +187,6 @@ func (s *Server) publish(snapshot StatusSnapshot) {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
-	s.mu.Lock()
-	s.conns[conn] = struct{}{}
-	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		delete(s.conns, conn)

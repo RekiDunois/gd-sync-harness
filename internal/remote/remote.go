@@ -17,10 +17,13 @@ import (
 type Manager struct {
 	Rclone *exec.Rclone
 	DB     *state.DB
+	sleep  func(time.Duration)
 }
 
 // New builds a Manager.
-func New(r *exec.Rclone, db *state.DB) *Manager { return &Manager{Rclone: r, DB: db} }
+func New(r *exec.Rclone, db *state.DB) *Manager {
+	return &Manager{Rclone: r, DB: db, sleep: time.Sleep}
+}
 
 func isDriveBackend(backend string) bool { return backend == "drive" }
 
@@ -109,7 +112,7 @@ func (m *Manager) ResolveFolderID(ctx context.Context, remote, remotePath string
 				break
 			}
 			if attempt < 4 {
-				time.Sleep(consistencyRetryDelay(attempt))
+				m.sleep(consistencyRetryDelay(attempt))
 			}
 		}
 		if found == "" {
