@@ -60,6 +60,19 @@ func TestReconcileRejectsRemoteDuplicatesBeforeDryRun(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsDuplicateDirectoriesBeforeDryRun(t *testing.T) {
+	svc, _, p, logPath := newServiceFixture(t)
+	t.Setenv("FAKE_RCLONE_MODE", "duplicate-dirs")
+	_, err := NewReconciler(svc).ReconcileProtected(context.Background(), p, &policy.Snapshot{}, SyncOptions{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "remote duplicates detected") {
+		t.Fatalf("error = %v, want duplicate-directory rejection", err)
+	}
+	log := readFakeRcloneLog(t, logPath)
+	if containsLine(log, "--dry-run") {
+		t.Fatalf("duplicate-directory rejection must stop before dry-run:\n%s", log)
+	}
+}
+
 func TestReconcileDeletesProvenPathsAndSucceedsWithoutDeletes(t *testing.T) {
 	for _, test := range []struct {
 		name       string

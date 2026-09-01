@@ -267,8 +267,10 @@ func (s *Service) VerifyFull(ctx context.Context, p *state.Profile) error {
 }
 
 func (s *Service) remoteDuplicates(ctx context.Context, p *state.Profile) (bool, error) {
-	res := s.Rclone.Run(ctx, "lsjson", "--recursive",
-		p.RemoteName+":"+p.RemoteDisplayPath)
+	args := []string{"lsjson", "--recursive"}
+	args = append(args, s.RcloneConfig.GlobalArgs...)
+	args = append(args, p.RemoteName+":"+p.RemoteDisplayPath)
+	res := s.Rclone.Run(ctx, args...)
 	if res.Err != nil {
 		var exitErr interface{ ExitCode() int }
 		if errors.As(res.Err, &exitErr) && exitErr.ExitCode() == 3 {
@@ -286,9 +288,6 @@ func (s *Service) remoteDuplicates(ctx context.Context, p *state.Profile) (bool,
 	}
 	counts := make(map[string]int, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir {
-			continue
-		}
 		key := entry.Path
 		if key == "" {
 			key = entry.Name

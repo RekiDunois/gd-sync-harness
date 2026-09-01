@@ -42,6 +42,7 @@ case "${FAKE_RCLONE_MODE:-}:$command:$dry" in
   fail-live:sync:) printf 'sync failed\n' >&2; exit 1 ;;
   fail-delete:deletefile:) printf 'delete failed\n' >&2; exit 1 ;;
   duplicate:lsjson:) printf '[{"Path":"duplicate.md","Name":"duplicate.md","IsDir":false},{"Path":"duplicate.md","Name":"duplicate.md","IsDir":false}]\n' ;;
+  duplicate-dirs:lsjson:) printf '[{"Path":"notes","Name":"notes","IsDir":true},{"Path":"notes","Name":"notes","IsDir":true}]\n' ;;
   *:lsjson:) printf '[]\n' ;;
   dry-counts:sync:yes) printf 'Transferred: 2 / 2\nDeleted: 3 (files)\n' ;;
   dry-malformed:sync:yes) printf 'not a dry-run summary\n' ;;
@@ -191,5 +192,21 @@ func TestSyncFailsClosedWhenPolicySourceCannotBeScanned(t *testing.T) {
 	p.SourcePath = filepath.Join(t.TempDir(), "missing")
 	if _, err := svc.DryRunSyncProtected(context.Background(), p, &policy.Snapshot{}, SyncOptions{}); err == nil {
 		t.Fatal("missing policy source must fail closed")
+	}
+}
+
+func TestRemoteDuplicateCheckUsesGlobalArgs(t *testing.T) {
+	svc, _, p, logPath := newServiceFixture(t)
+	svc.RcloneConfig = config.RcloneConfig{GlobalArgs: []string{"--global-test=value"}}
+	duplicates, err := svc.remoteDuplicates(context.Background(), p)
+	if err != nil {
+		t.Fatalf("remoteDuplicates: %v", err)
+	}
+	if duplicates {
+		t.Fatal("empty fake listing must not report duplicates")
+	}
+	log := readFakeRcloneLog(t, logPath)
+	if !strings.Contains(log, "--global-test=value") {
+		t.Fatalf("global rclone arg missing from duplicate check:\n%s", log)
 	}
 }
