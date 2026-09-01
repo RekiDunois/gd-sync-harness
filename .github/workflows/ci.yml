@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - master
-  schedule:
-    - cron: '17 3 * * 1'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -150,8 +148,8 @@ jobs:
           if-no-files-found: warn
 
   race:
-    name: race (weekly)
-    if: github.event_name == 'schedule'
+    name: race (push)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
