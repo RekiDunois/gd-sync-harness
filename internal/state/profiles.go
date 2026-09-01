@@ -267,7 +267,8 @@ func (d *DB) TombstoneProfile(id string) error {
 
 // RestoreProfile clears tombstone state on a deleted profile.
 func (d *DB) RestoreProfile(id string) error {
-	_, err := d.Exec(`UPDATE profiles SET tombstoned = 0, deleted_at = NULL, updated_at = ? WHERE id = ?`,
+	_, err := d.Exec(`UPDATE profiles SET tombstoned = 0, deleted_at = NULL,
+		deletion_requested_at = NULL, updated_at = ? WHERE id = ?`,
 		Now().Format(timeFmt), id)
 	return err
 }
