@@ -87,9 +87,6 @@ jobs:
   coverage:
     name: coverage
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
-    # Coverage is informational until the metrics and package floors have been
-    # calibrated. The verify job remains the correctness gate.
-    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -113,6 +110,26 @@ jobs:
 
       - name: Cross-package coverage
         run: go test -count=1 -coverpkg=./... -coverprofile=coverage-cross.out ./...
+
+      - name: Enforce coverage gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          total="$(go tool cover -func=coverage-cross.out | awk '$1 == "total:" {gsub("%", "", $3); print $3}')"
+          # Start with the documented Phase 4 gate; raise this to 70% after
+          # two stable CI iterations without weakening the package floors.
+          awk -v actual="$total" 'BEGIN { if (actual < 65) { printf "cross-package coverage %.1f%% is below 65%%\n", actual; exit 1 } }'
+          for package in internal/state internal/sync internal/remote internal/sidecar; do
+            profile="coverage-${package##*/}.out"
+            go test -count=1 -coverprofile="$profile" "./$package"
+            floor="$(go tool cover -func="$profile" | awk '$1 == "total:" {gsub("%", "", $3); print $3}')"
+            awk -v name="$package" -v actual="$floor" 'BEGIN { if (actual < 60) { printf "%s coverage %.1f%% is below 60%%\n", name, actual; exit 1 } }'
+          done
+          printf 'coverage gates: cross-package %.1f%%, safety package floors >= 60%%\n' "$total"
+
+      - name: Publication audit regression tests
+        shell: bash
+        run: sh scripts/publication-audit_test.sh
 
       - name: Render coverage summaries
         if: always()
