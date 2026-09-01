@@ -82,6 +82,16 @@ func openPhase3DB(t *testing.T, f *phase3CLIFixture) *state.DB {
 
 func TestPhase3CLIProfileConfigAndStatus(t *testing.T) {
 	f := newPhase3CLIFixture(t, "cli-state")
+	for _, args := range [][]string{
+		{"config", "get", "unknown"},
+		{"config", "set", "unknown", "value"},
+		{"config", "set", "socket-path", "   "},
+		{"config", "unset", "unknown"},
+	} {
+		if err := runPhase3CLI(args...); err == nil {
+			t.Fatalf("%v unexpectedly succeeded", args)
+		}
+	}
 
 	for _, args := range [][]string{
 		{"profile", "show", f.profile.ID},
@@ -175,6 +185,13 @@ func TestPhase3CLIProfileLifecycleAndDryRun(t *testing.T) {
 	if _, err := db.GetProfile(f.profile.ID); err == nil {
 		t.Fatal("forgotten profile must be removed")
 	}
+	_ = db.Close()
+	if err := runPhase3CLI("status"); err != nil {
+		t.Fatalf("status without active profiles: %v", err)
+	}
+	if err := runPhase3CLI("profile", "list"); err != nil {
+		t.Fatalf("profile list without profiles: %v", err)
+	}
 }
 
 func TestPhase3CLIIgnoreAndPruneCommands(t *testing.T) {
@@ -237,6 +254,19 @@ func TestPhase3CLIIgnoreAndPruneCommands(t *testing.T) {
 
 func TestPhase3CLIVerifyReconcileWorkerAndCompiler(t *testing.T) {
 	f := newPhase3CLIFixture(t, "cli-worker")
+	db := openPhase3DB(t, f)
+	if err := db.RequestProfileDeletion(f.profile.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	if err := runPhase3CLI("reconcile-now", f.profile.ID, "--allow-deletes", "3"); err == nil {
+		t.Fatal("reconcile-now on deleting profile unexpectedly succeeded")
+	}
+	db = openPhase3DB(t, f)
+	if err := db.CancelProfileDeletion(f.profile.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
 	putRemoteTestFile(t, &App{Rclone: rcexec.NewRclone(mustRclone(t), os.Getenv("RCLONE_CONFIG"))}, f.profile, "a.md", "hello")
 	if err := runPhase3CLI("verify", f.profile.ID); err != nil {
 		t.Fatalf("verify check: %v", err)
@@ -259,7 +289,7 @@ func TestPhase3CLIVerifyReconcileWorkerAndCompiler(t *testing.T) {
 	if err := runPhase3CLI("compiler", "clean", f.profile.ID); err != nil {
 		t.Fatalf("compiler clean: %v", err)
 	}
-	db := openPhase3DB(t, f)
+	db = openPhase3DB(t, f)
 	cs, err := db.GetCompilerState(f.profile.ID)
 	if err != nil {
 		t.Fatal(err)
