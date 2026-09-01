@@ -22,9 +22,13 @@ type Scheduler struct {
 type remoteQueue struct {
 	mu   sync.Mutex
 	cond *sync.Cond
-	jobs []Job
-	// slots is a counting semaphore for concurrent executions on this remote.
-	slots chan struct{}
+	jobs []queuedJob
+}
+
+type queuedJob struct {
+	ctx  context.Context
+	job  Job
+	done chan<- error
 }
 
 // New builds a scheduler. MaxConcurrent is per-remote.
@@ -38,65 +42,52 @@ func New(maxConcurrent int) *Scheduler {
 // Submit queues a job for a remote and returns a channel that completes when
 // the job is done. Priority sorts within the remote queue (higher first).
 func (s *Scheduler) Submit(ctx context.Context, job Job) (done chan error) {
+	done = make(chan error, 1)
 	s.mu.Lock()
 	q, ok := s.queues[job.Remote]
 	if !ok {
-		q = &remoteQueue{slots: make(chan struct{}, s.MaxConcurrent)}
+		q = &remoteQueue{}
 		q.cond = sync.NewCond(&q.mu)
 		s.queues[job.Remote] = q
+		for i := 0; i < s.MaxConcurrent; i++ {
+			go s.run(q)
+		}
 	}
 	s.mu.Unlock()
 
 	q.mu.Lock()
 	inserted := false
+	queued := queuedJob{ctx: ctx, job: job, done: done}
 	for i, j := range q.jobs {
-		if job.Priority > j.Priority {
-			q.jobs = append(q.jobs, Job{})
+		if job.Priority > j.job.Priority {
+			q.jobs = append(q.jobs, queuedJob{})
 			copy(q.jobs[i+1:], q.jobs[i:])
-			q.jobs[i] = job
+			q.jobs[i] = queued
 			inserted = true
 			break
 		}
 	}
 	if !inserted {
-		q.jobs = append(q.jobs, job)
+		q.jobs = append(q.jobs, queued)
 	}
 	q.cond.Signal()
 	q.mu.Unlock()
-
-	done = make(chan error, 1)
-	go func() {
-		err := s.run(ctx, q)
-		done <- err
-	}()
 	return done
 }
 
-// run pops and executes a single job, acquiring a per-remote slot. The caller
-// (per Submit) runs exactly one job; the queue coordinates the rest.
-func (s *Scheduler) run(ctx context.Context, q *remoteQueue) error {
-	q.mu.Lock()
-	for len(q.jobs) == 0 {
-		q.cond.Wait()
-		if ctx.Err() != nil {
-			q.mu.Unlock()
-			return ctx.Err()
-		}
-	}
-	job := q.jobs[0]
-	q.jobs = q.jobs[1:]
-	q.mu.Unlock()
-
-	select {
-	case q.slots <- struct{}{}:
-	case <-ctx.Done():
-		// Requeue at front and return.
+// run owns one execution slot for a remote queue. Jobs are dequeued only by
+// these workers, so priority ordering is preserved even when Submit starts
+// several calls concurrently.
+func (s *Scheduler) run(q *remoteQueue) {
+	for {
 		q.mu.Lock()
-		q.jobs = append([]Job{job}, q.jobs...)
-		q.cond.Signal()
+		for len(q.jobs) == 0 {
+			q.cond.Wait()
+		}
+		queued := q.jobs[0]
+		q.jobs = q.jobs[1:]
 		q.mu.Unlock()
-		return ctx.Err()
+
+		queued.done <- queued.job.Run(queued.ctx)
 	}
-	defer func() { <-q.slots }()
-	return job.Run(ctx)
 }
