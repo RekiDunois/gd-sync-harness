@@ -250,6 +250,9 @@ func (s *Server) handleSubscribe(conn net.Conn, msg *Message, done <-chan struct
 		_ = writeLine(conn, resp)
 		return
 	}
+	ch := s.hub.Subscribe(sub.ProfileID)
+	defer s.hub.Unsubscribe(sub.ProfileID, ch)
+
 	initial := s.versioned(*snapshot)
 	b, err := statusPayload(initial)
 	if err != nil {
@@ -258,8 +261,6 @@ func (s *Server) handleSubscribe(conn net.Conn, msg *Message, done <-chan struct
 	if err := writeLine(conn, b); err != nil {
 		return
 	}
-	ch := s.hub.Subscribe(sub.ProfileID)
-	defer s.hub.Unsubscribe(sub.ProfileID, ch)
 	for {
 		select {
 		case sn, ok := <-ch:
