@@ -18,10 +18,12 @@ tip with a clean checkout.
 | Cross-package coverage | `go test -count=1 -coverpkg=./... -coverprofile=coverage-all.out ./...` | 54.9% |
 
 The package-local figure is the current CI-equivalent baseline. The
-cross-package figure is the better progress metric because CLI and integration
-tests exercise lower-level packages. Both profiles should be retained while
-coverage work is in progress so a package does not appear healthy only because
-another package happened to call it.
+cross-package figure is the better total-progress metric because CLI and
+integration tests exercise lower-level packages. CI should generate and retain
+both profiles: use the cross-package profile for the total-coverage ratchet,
+and use the package-local profile for safety-critical package floors and the
+package-specific phase targets below. This prevents a package from appearing
+healthy only because another package happened to call it.
 
 ### Package-local snapshot
 
@@ -75,13 +77,18 @@ behavior is more valuable than executing registration lines.
 
 ### Phase 0: Make Measurement Repeatable
 
-1. Add a CI coverage job using the cross-package command and publish the
-   `go tool cover -func` summary as an artifact or job summary.
+1. Add a CI coverage job that generates both profiles: the package-local
+   `go test -count=1 -coverprofile=coverage-package.out ./...` profile and the
+   cross-package `go test -count=1 -coverpkg=./... -coverprofile=coverage-cross.out ./...`
+   profile. Publish both `go tool cover -func` summaries as artifacts or job
+   summaries.
 2. Keep `go test -count=1 ./...` as the correctness gate; make coverage
    informational for the first iteration to avoid setting a misleading gate on
    an uncalibrated metric.
-3. Record both total coverage and package-level coverage. A total increase
-   must not hide a regression in `state`, `sync`, `remote`, or `sidecar`.
+3. Define the cross-package total as the ratchet metric. Define package floors
+   and the Phase 2/3 package targets against the package-local profile. A total
+   increase must not hide a regression in `state`, `sync`, `remote`, or
+   `sidecar`.
 4. Run `go vet ./...`, the normal suite, and a periodic `go test -race ./...`
    for concurrency-heavy `state`, `live`, `sched`, and `watch` code.
 
@@ -99,6 +106,11 @@ controlled stdout, stderr, and exit codes.
    validation, managed-root creation, nested and duplicate folder resolution,
    eventual-consistency retries, strict binding failures, not-found versus
    transport errors in `InspectPath`, and quota OK/low/full/unknown outcomes.
+   Before testing the retry path, make the folder resolver's wait injectable at
+   the package boundary (for example, a package-private `Manager` sleeper or
+   retry policy). Production uses the real sleep; tests use a no-op recorder and
+   assert the retry count and the exact 200ms, 400ms, 800ms, and 1600ms backoff
+   sequence without waiting.
 3. Add `internal/state` tests for the untested durable transitions:
    `FailCompilerRun`, `FinishCompilerClean`, `FinishDerivedRunFailure`,
    `UpdateDerivedRunPhase`, `ScheduleDestructiveReconcile`,
@@ -127,9 +139,9 @@ OS/process boundary.
    contention, claim results, derived publish/purge success and failure,
    interrupted run recovery, cleanup after compiler clean, and structured error
    classification by rclone exit code.
-4. Replace sleeps in new tests with deterministic seams where practical. If a
-   clock or debounce dependency must be introduced, keep it local to the
-   scheduler/reconcile boundary rather than making time global mutable state.
+4. Replace remaining scheduler/reconcile sleeps in new tests with deterministic
+   seams where practical. If a clock or debounce dependency must be introduced,
+   keep it local to that boundary rather than making time global mutable state.
 
 **Exit target:** `internal/state` and `internal/sync` package-local coverage at
 least 70%; cross-package total at least 68%.
@@ -159,10 +171,12 @@ least 70%; cross-package total at least 68%.
    treating path construction as more important than state correctness.
 2. Add a POSIX shell test for `scripts/publication-audit.sh` covering clean
    trees, current-tree violations, history violations, denylist matches, and
-   report-only output. Fixtures must contain only synthetic tokens and paths.
+   warning-only/manual-review output with exit code 3. Fixtures must contain
+   only synthetic tokens and paths.
 3. After two stable CI iterations, enforce a cross-package total threshold of
-   65%, then raise it to 70% after Phase 2. Add package floors of 60% for
-   `internal/state`, `internal/sync`, `internal/remote`, and `internal/sidecar`.
+   65%, then raise it to 70% after Phase 2. Using the package-local profile, add
+   package floors of 60% for `internal/state`, `internal/sync`,
+   `internal/remote`, and `internal/sidecar`.
 4. Use a ratchet rule: new or changed production files must not reduce total
    coverage, and safety-critical packages must not regress below their floor.
 
